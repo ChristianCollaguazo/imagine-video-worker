@@ -1,0 +1,133 @@
+# Imagine Video Worker (standalone)
+
+Servicio privado de una sola cola para convertir **una imagen inicial y un prompt** en un MP4 de 10 o 15 segundos. El modelo es MiniMax H3 Base **FL2VA completo en BF16**, usando los nodos nativos de ComfyUI; el flujo no carga Turbo ni LoRA. El worker se mantiene local mientras se integra con Imagine. La guía de Pod al final documenta una futura instalación aislada, sin desplegarla ni publicar el repositorio.
+
+## Estado y alcance
+
+- `app/` contiene el worker privado y el adaptador ComfyUI.
+- `config/model-manifest.json` es la única fuente de verdad para revisiones, archivos y SHA-256 de pesos.
+- `scripts/` trae bootstrap, descarga verificada, inicio y apagado. Bootstrap no instala ni descarga nada si no se pasa una opción explícita.
+- No se incluyen secretos, fotos, resultados ni pesos en Git. El `.gitignore` local excluye esos archivos.
+
+## Requisitos y tamaño
+
+El manifiesto fija ComfyUI `v0.34.0`, que incluye los nodos MiniMax H3 en core. No hacen falta nodos externos. En una máquina NVIDIA se recomienda Python 3.12, driver NVIDIA compatible con CUDA 13, almacenamiento persistente de **al menos 200 GB** para el código, más de 123 GB de pesos, archivos auxiliares, caché de descargas y margen.
+
+Pesos fijados en el manifiesto:
+
+| Archivo | Función | Tamaño publicado |
+|---|---|---:|
+| `minimax_h3_fl2va_bf16.safetensors` | Difusión FL2VA BF16 completa | 66.3 GB |
+| `qwen3vl_32b_minimax_h3_bf16.safetensors` | Encoder de texto e imagen BF16 | 51.5 GB |
+| `minimax_h3_video_vae_fp16.safetensors` | VAE de video | 5.21 GB |
+| `minimax_h3_audio_vae_fp32.safetensors` | VAE de audio | 605 MB |
+
+El manifiesto fija Python 3.12, PyTorch 2.11.0, torchvision 0.26.0 y torchaudio 2.11.0 con la rueda oficial CUDA 13.0; `TORCH_INDEX_URL` permite seleccionar otra rueda oficial compatible. PyTorch documenta estas ruedas CUDA y amplía soporte CUDA 13 a Blackwell y Hopper; comprueba la combinación concreta de driver, wheel y GPU antes de instalar. La tarjeta RTX PRO 6000 de 96 GB **no está validada aquí para BF16 a 15 s** y no se garantiza que una tarea quepa sin offload u optimización. H200 es una opción con más memoria; tampoco implica una validación de rendimiento. Haz una prueba controlada y mira el uso de VRAM antes de presupuestar cargas recurrentes.
+
+El preflight muestra GPU, VRAM, driver, memoria del sistema y espacio libre; bloquea la descarga si no hay espacio para los pesos faltantes más margen de caché. Después de instalar, bootstrap verifica CUDA/BF16 en PyTorch y que `ffmpeg`/`ffprobe` estén disponibles. El preflight no mide el tiempo por video ni valida que 96 GB basten para la generación completa.
+
+## Duración, resolución y exportación
+
+H3 acepta longitudes en la cuadrícula `17k + 5` cuadros a 24 fps. Para satisfacer el objetivo de video exacto, el workflow genera el legal más cercano hacia arriba y el worker recorta y vuelve a codificar a H.264 a 24 fps:
+
+| Pedido | Cuadros generados por H3 | MP4 final | Duración final |
+|---|---:|---:|---:|
+| 10 s | 243 (10.125 s) | 240 | 10.000 s |
+| 15 s | 362 (15.083 s) | 360 | 15.000 s |
+
+La resolución usa lados múltiplos de 32 y un lado corto de 768, dentro del canvas nativo máximo de 1344 × 768 (apaisado) o 768 × 1344 (vertical). El nodo nativo estira el primer cuadro para llenar el canvas; fotos muy panorámicas, muy altas o de otra relación de aspecto pueden deformarse. Recorta la imagen de origen a la relación de aspecto de salida si quieres conservar proporciones.
+
+## Configuración inicial en una máquina CUDA
+
+Las instrucciones son deliberadamente explícitas: ejecutar `--install-runtime` instala paquetes y clona ComfyUI; ejecutar `--download-models` descarga unos 123 GB. No las ejecutes antes de revisar el presupuesto, el almacenamiento, la licencia y la ubicación física.
+
+```bash
+cd imagine-video-worker
+scripts/bootstrap.sh --install-runtime
+scripts/bootstrap.sh --download-models
+```
+
+Si Hugging Face solicita acceso al modelo, acepta la licencia en la cuenta autorizada y facilita `HF_TOKEN` solo en el entorno del proceso de descarga. No lo pegues en el repositorio, comandos guardados, historial de terminal ni archivo `.env`.
+
+La descarga valida los cuatro hashes SHA-256 del manifiesto. Si un hash no coincide, descarga fallará con el nombre exacto del archivo; elimina solo ese archivo corrupto de `ComfyUI/models/<ruta>` y vuelve a ejecutar `--download-models`. Los archivos parciales de caché de Hugging Face se pueden reanudar.
+
+Antes de iniciar, inyecta `IMAGINE_VIDEO_TOKEN` desde el gestor de secretos del sistema donde corre el servicio. Debe ser un token aleatorio largo. Para una sesión local de shell puede exportarse temporalmente en el entorno; no se guarda en Git. En una futura instancia Pod, usa el gestor de secretos del proveedor.
+
+```bash
+export IMAGINE_VIDEO_TOKEN='(inyectado desde el gestor de secretos)'
+scripts/start.sh
+```
+
+ComfyUI escucha solo en `127.0.0.1:8188`. El worker escucha en el puerto `8000`; en Pod, expón únicamente su proxy **HTTPS**. La ruta `GET /v1/health` requiere Bearer token y comprueba CUDA y nodos de ComfyUI. Los archivos de fotos, videos, temporales y estado de cola van a `/tmp/imagine-video-worker`; los logs se descartan y ComfyUI no escribe metadatos de prompt en el MP4. El worker borra los medios ligados al trabajo al completar, fallar, cancelar, expirar o reiniciar. El límite de carga del worker es 50 MiB por imagen.
+
+Para apagar:
+
+```bash
+scripts/stop.sh
+```
+
+El apagado pide terminación normal al worker y a ComfyUI. Al volver a iniciar, el worker vacía sus trabajos transitorios. Revisa `scripts/stop.sh` y el estado del proceso; no des por detenida una máquina facturable por cerrar la terminal.
+
+## API privada
+
+Cada petición de trabajo necesita `Authorization: Bearer <IMAGINE_VIDEO_TOKEN>`, una imagen JPEG/PNG/WebP, el prompt y `duration_seconds` igual a 10 o 15. Hay una sola tarea activa y no se aceptan imágenes por lote ni imágenes finales opcionales. La respuesta del worker incluye un ID; consulta ese trabajo hasta `completed`, descarga el MP4 y envía el ACK para purgarlo. Los endpoints y los límites de carga están en `app/main.py`.
+
+| Ruta | Acción | Comportamiento |
+|---|---|---|
+| `GET /v1/health` | Salud autenticada | Comprueba CUDA y los nodos nativos requeridos |
+| `POST /v1/jobs` | Subir una foto, prompt y duración | Máximo 50 MiB; soporta `Idempotency-Key`; una tarea activa |
+| `GET /v1/jobs/{id}` | Consultar progreso/estado | Fases de carga, muestreo, decodificación y exportación |
+| `GET /v1/jobs/{id}/result` | Descargar MP4 | Disponible mientras el resultado esté retenido |
+| `POST /v1/jobs/{id}/ack` | Confirmar importación | Borra la copia remota del resultado y vence el trabajo |
+| `DELETE /v1/jobs/{id}` | Cancelar o purgar | Interrumpe el trabajo y borra sus temporales |
+
+El resultado se conserva hasta que se confirme con ACK o caduque: 15 minutos de retención, revisados por un barrido cada 30 segundos. `IMAGINE_VIDEO_JOB_TIMEOUT_SECONDS` ajusta el límite de generación; por defecto es 5400 segundos (90 minutos; mínimo 60). El token también se exige en salud. No se registran prompts ni medios en logs persistentes.
+
+Comprueba la salud:
+
+```bash
+printf 'url = "https://<HOST-HTTPS-DEL-WORKER>/v1/health"\nheader = "Authorization: Bearer %s"\nfail\nsilent\nshow-error\n' "$IMAGINE_VIDEO_TOKEN" | curl --config - --output /dev/null --max-time 10
+```
+
+La URL HTTP local del worker se puede usar en un entorno local de confianza. No publiques 8188 ni habilites la interfaz web de ComfyUI en Internet.
+
+## Runbook futuro: Pod privada con CUDA
+
+Este procedimiento es para una futura ejecución; actualmente Imagine conserva el worker local. La copia de código de GitHub todavía no se ha publicado. Sustituye `OWNER/PRIVATE_REPO` por la ruta real cuando exista.
+
+1. **Revisar licencia y región antes de crear la Pod o descargar pesos.** La licencia comunitaria de MiniMax H3 define como territorios excluidos Estados Unidos, Unión Europea, Reino Unido y República de Corea. El uso alojado también está sujeto a esa restricción; elige una región física fuera de esas zonas o consigue autorización previa de MiniMax. Confirma la licencia vigente y región concreta del proveedor, no solo la ubicación de quien opera la cuenta.
+2. **Preflight del costo.** El objetivo de gasto de este ensayo es **US$7 total**. Antes de iniciar, verifica en el panel el precio por hora vigente de la GPU, almacenamiento persistente, cargo mientras la Pod está detenida, descarga inicial de 123+ GB, transferencia y tiempo de arranque. Estima el total con margen para primer inicio y generación; si no cabe bajo US$7, no inicies. El precio cambia por región y disponibilidad; este README no cotiza ni reserva infraestructura.
+3. **Crear una Pod privada (Secure Cloud)** con acceso SSH privado, entorno Linux CUDA, volumen persistente montado en `/workspace` de al menos 200 GB. Considera RTX PRO 6000 96 GB como una opción no validada para 15 s BF16; H200 es opcional y más costoso. Configura el proveedor para no admitir acceso público directo por SSH y usa clave SSH controlada por ti. RunPod usa `https://<pod-id>-<port>.proxy.runpod.net` para un puerto HTTP expuesto; selecciona únicamente `8000/http` y la opción de SSH privada necesaria para administración. No expongas `8188`.
+4. **Clonar el repositorio privado en el volumen**, con autenticación Git de solo lectura configurada como clave deploy de solo lectura en el gestor de secretos del proveedor. No añadas credenciales al código ni guardes la clave en el volumen.
+
+   ```bash
+   cd /workspace
+   git clone --depth 1 git@github.com:OWNER/PRIVATE_REPO.git imagine-video-worker
+   cd imagine-video-worker
+   ```
+
+5. **Instalar una vez** en el volumen persistente con el mismo bootstrap anterior. ComfyUI y los pesos quedan bajo el árbol montado en `/workspace`; detén la Pod sin borrar el volumen para conservarlos. No coloques fotos de usuarios, resultados ni tokens en ese volumen.
+6. **Configurar secretos fuera del repositorio**: inyecta `IMAGINE_VIDEO_TOKEN` desde el gestor de secretos del proveedor. No copies `.env`, claves privadas, contraseñas ni tokens al directorio de trabajo. Usa un token nuevo para la instancia remota.
+7. **Limitar red**: deja el servidor ComfyUI `8188` accesible solo por loopback; expón el servicio del worker por el endpoint HTTPS del proveedor en `8000`; no abras otros puertos de aplicación. Mantén SSH privado para la administración. Revisa reglas de red y URL antes de enviar una foto.
+8. **Arrancar y comprobar salud**, hacer validación aislada con la misma foto autorizada: genera primero 10 s y verifica MP4 exacto de 240 cuadros, 24 fps y H.264; ACK/purga ese trabajo. Luego genera 15 s y verifica 360 cuadros, 24 fps y H.264; ACK/purga ese trabajo. Incluye la descarga fría y ambos trabajos en el límite total de US$7; mira el gasto entre trabajos y no inicies el segundo si la proyección supera el límite. La URL HTTPS es `https://<pod-id>-8000.proxy.runpod.net`. Si hay error CUDA/OOM, detén el servicio y la Pod; no cambies a pesos cuantizados/Turbo en este despliegue BF16.
+9. **Conectar Imagine local al Pod**: en el archivo raíz `Imagine/.env` (ignorado por Git), añade `IMAGINE_VIDEO_URL=https://<pod-id>-8000.proxy.runpod.net` y `IMAGINE_VIDEO_TOKEN=<el mismo secreto inyectado en la Pod>`. Luego detén la app local y arráncala de nuevo con `./start_wardrobe_app.command`; el backend lee `.env` durante el arranque. Comprueba que la salud HTTPS con token responde, inicia un único video de prueba desde Imagine y confirma que el MP4 se importa localmente. Mantén las claves solo en el gestor de secretos y `.env` local.
+10. **Cerrar después de cada sesión**: ejecuta `scripts/stop.sh`, comprueba `GET /v1/health` deja de responder con una petición Bearer que tenga timeout, detén la Pod desde el panel y verifica que la GPU ya no factura. Revisa el costo acumulado cada vez que inicias o detienes; una terminal cerrada no detiene la facturación. La persistencia o costo del volumen puede continuar al parar la Pod; confirma los cargos en el panel.
+11. **Limpieza final**: descarga solo los MP4 que quieras conservar; luego elimina la Pod y, si ya no necesitas el caché, borra el volumen persistente desde el panel. Comprueba que desaparecieron los recursos facturables. La limpieza normal de trabajos elimina imagen, video e intermedios temporales; borrar el volumen además borra los pesos que tendrías que volver a descargar.
+
+### Inicio de sesiones posteriores
+
+1. En el panel inicia la Pod ya creada y confirma que quedó `RUNNING`, en la región física autorizada y con el volumen `/workspace` adjunto.
+2. Comprueba el gasto acumulado y la tarifa actual antes de abrir el servicio. El volumen puede conservar cargos aunque la GPU esté parada.
+3. Conéctate por SSH privado, entra a `/workspace/imagine-video-worker` y ejecuta `scripts/start.sh`. Los pesos permanecen en el volumen; no repitas `--install-runtime` ni `--download-models`.
+4. Desde Imagine, confirma la salud HTTPS con token y procesa solo los trabajos necesarios.
+5. Al acabar, `scripts/stop.sh`, revisa la limpieza y detén la Pod desde el panel. Verifica de nuevo el gasto y el estado de la GPU.
+
+## Fuentes oficiales fijadas
+
+- [Guía oficial de MiniMax H3 en ComfyUI](https://github.com/Comfy-Org/docs/blob/main/tutorials/video/minimax/minimax-h3-native.mdx): 768 px en el lado corto, 1344 × 768 nativo, cuadro `17k + 5`, nodos nativos, Turbo opcional.
+- [ComfyUI v0.34.0](https://github.com/Comfy-Org/ComfyUI/releases/tag/v0.34.0): release de core con nodos MiniMax H3.
+- [Manifiesto de archivos Comfy-Org](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main): pesos BF16 y VAEs usados por este flujo.
+- [Licencia comunitaria oficial MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE): alcance territorial, restricciones y condiciones para servicios alojados.
+- [PyTorch: instalación local](https://pytorch.org/get-started/locally/) y [versiones CUDA anteriores](https://pytorch.org/get-started/previous-versions/): elige la rueda adecuada para el driver y GPU concretos.
+- [PyTorch: soporte CUDA 13 y Blackwell](https://dev-discuss.pytorch.org/t/introducing-cuda-13-2-and-deprecating-cuda-12-8-release-2-12/3337).
+- [RunPod: URLs de Pod, regiones, puertos y ciclo de vida](https://docs.runpod.io/runpodctl/reference/runpodctl-remove-pods) y [persistencia de `/workspace`](https://docs.runpod.io/pods/troubleshooting/zero-gpus).
