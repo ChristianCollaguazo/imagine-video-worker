@@ -4,19 +4,29 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 manifest = json.loads((root / "config/model-manifest.json").read_text())
 model_root = root / "ComfyUI/models"
-for item in manifest["models"]:
+if sys.argv[1:] not in ([], ["--include-turbo"], ["--turbo-only"]):
+    raise SystemExit("Usage: download_models.py [--include-turbo|--turbo-only]")
+items = list(manifest["models"])
+if sys.argv[1:] == ["--turbo-only"]:
+    items = list(manifest.get("optional_models", []))
+elif sys.argv[1:] == ["--include-turbo"]:
+    items += manifest.get("optional_models", [])
+for item in items:
     destination = model_root / item["path"]
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not destination.is_file():
         hf_cli = root / ".venv-comfy/bin/hf"
+        repo = item.get("repo", "Comfy-Org/MiniMax-H3")
+        revision = item.get("revision", manifest["revision"])
         subprocess.run([
-            str(hf_cli), "download", "Comfy-Org/MiniMax-H3", item["path"],
-            "--revision", manifest["revision"], "--local-dir", str(model_root),
+            str(hf_cli), "download", repo, item["path"],
+            "--revision", revision, "--local-dir", str(model_root),
         ], check=True)
     digest = hashlib.sha256()
     with destination.open("rb") as stream:

@@ -12,32 +12,39 @@ TORCH_INDEX_URL="${TORCH_INDEX_URL:-$(python3 -c 'import json,sys; print(json.lo
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/bootstrap.sh [--install-runtime] [--download-models]
+Usage: scripts/bootstrap.sh [--install-runtime] [--download-models] [--download-turbo]
 
 No action runs by default. --install-runtime installs the pinned ComfyUI source
 and Python environment on a CUDA Linux host. --download-models downloads the
-large BF16 checkpoint files into the persistent ComfyUI models directory.
+shared quantized H3 model stack into the persistent ComfyUI models directory.
+--download-turbo downloads the optional 8-step Lightning LoRA (about 2 GB).
 Review the model license and ensure the provider's budget is sufficient first.
 USAGE
 }
 
 install_runtime=0
 download_models=0
+download_turbo=0
 for arg in "$@"; do
   case "$arg" in
     --install-runtime) install_runtime=1 ;;
     --download-models) download_models=1 ;;
+    --download-turbo) download_turbo=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
 done
 
-if [[ "$install_runtime" -eq 0 && "$download_models" -eq 0 ]]; then
+if [[ "$install_runtime" -eq 0 && "$download_models" -eq 0 && "$download_turbo" -eq 0 ]]; then
   usage
   exit 0
 fi
 
-if [[ "$install_runtime" -eq 1 || "$download_models" -eq 1 ]]; then
+if [[ "$download_turbo" -eq 1 && ( "$install_runtime" -eq 1 || "$download_models" -eq 1 ) ]]; then
+  python3 "$ROOT/scripts/preflight.py" --include-turbo
+elif [[ "$download_turbo" -eq 1 ]]; then
+  python3 "$ROOT/scripts/preflight.py" --turbo-only
+elif [[ "$install_runtime" -eq 1 || "$download_models" -eq 1 ]]; then
   python3 "$ROOT/scripts/preflight.py"
 fi
 
@@ -60,9 +67,20 @@ if [[ "$install_runtime" -eq 1 ]]; then
   "$ROOT/.venv-comfy/bin/python" -c 'import torch, torchaudio; assert torch.cuda.is_available(), "CUDA is unavailable to PyTorch"; assert torch.cuda.is_bf16_supported(), "GPU does not report BF16 support"; print(torch.cuda.get_device_name(0), "BF16 ready; torchaudio", torchaudio.__version__)'
 fi
 
-if [[ "$download_models" -eq 1 ]]; then
+if [[ "$download_models" -eq 1 || "$download_turbo" -eq 1 ]]; then
   [[ -d "$ROOT/ComfyUI/models" ]] || { echo "Run with --install-runtime first" >&2; exit 1; }
   [[ -x "$ROOT/.venv-comfy/bin/hf" ]] || { echo "Run with --install-runtime first" >&2; exit 1; }
+  if [[ "$download_turbo" -eq 1 && "$download_models" -eq 0 ]]; then
+    python3 "$ROOT/scripts/check_models.py" || { echo "Install the shared base stack with --download-models before downloading only Turbo" >&2; exit 1; }
+  fi
   cd "$ROOT"
-  "$ROOT/.venv-comfy/bin/python" scripts/download_models.py
+  if [[ "$download_turbo" -eq 1 ]]; then
+    if [[ "$download_models" -eq 1 ]]; then
+      "$ROOT/.venv-comfy/bin/python" scripts/download_models.py --include-turbo
+    else
+      "$ROOT/.venv-comfy/bin/python" scripts/download_models.py --turbo-only
+    fi
+  else
+    "$ROOT/.venv-comfy/bin/python" scripts/download_models.py
+  fi
 fi

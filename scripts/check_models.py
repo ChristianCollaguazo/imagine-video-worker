@@ -6,6 +6,8 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 manifest = json.loads((root / "config/model-manifest.json").read_text())
+# Base and Turbo share these required quantized models. Optional LoRAs do not
+# block worker startup; Turbo capability is reported only when its file/node exist.
 missing = [
     item["name"] for item in manifest["models"]
     if not (root / "ComfyUI/models" / item["path"]).is_file()

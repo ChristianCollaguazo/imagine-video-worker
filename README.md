@@ -1,6 +1,6 @@
 # Imagine Video Worker (standalone)
 
-Servicio privado de una sola cola para convertir **una imagen inicial y un prompt** en un MP4 de 10 o 15 segundos. El modelo es MiniMax H3 Base **FL2VA completo en BF16**, usando los nodos nativos de ComfyUI; el flujo no carga Turbo ni LoRA. El worker se mantiene local mientras se integra con Imagine. La guía de Pod al final documenta una futura instalación aislada, sin desplegarla ni publicar el repositorio.
+Servicio privado de una sola cola para convertir **una imagen inicial y un prompt** en un MP4 de 10 o 15 segundos. Base y Turbo reutilizan un único stack oficial H3 cuantizado: difusión FL2VA INT8 ConvRot, encoder Qwen3VL NVFP4-AWQ y VAE de video INT8. Base no usa LoRA; Turbo aplica la LoRA Lightning oficial a 8 pasos. Turbo es un experimento que se espera que genere más rápido, pero la calidad no está garantizada; la guía oficial advierte que puede suavizar el movimiento y el audio. La cuantización y Turbo tampoco cuentan con una evaluación de calidad en este worker. Este worker se ejecuta desde el repositorio privado desplegado en la Pod de servicio.
 
 ## Estado y alcance
 
@@ -11,20 +11,21 @@ Servicio privado de una sola cola para convertir **una imagen inicial y un promp
 
 ## Requisitos y tamaño
 
-El manifiesto fija ComfyUI `v0.34.0`, que incluye los nodos MiniMax H3 en core. No hacen falta nodos externos. En una máquina NVIDIA se recomienda Python 3.12, driver NVIDIA compatible con CUDA 13, almacenamiento persistente de **al menos 200 GB** para el código, más de 123 GB de pesos, archivos auxiliares, caché de descargas y margen.
+El manifiesto fija ComfyUI `v0.34.0`, que incluye los nodos MiniMax H3 en core. No hacen falta nodos externos. En una máquina NVIDIA se recomienda Python 3.12, driver NVIDIA compatible con CUDA 13 y almacenamiento persistente de **al menos 100 GB** para el código, unos 40 GB del stack cuantizado, archivos auxiliares, caché de descargas y margen. La LoRA Turbo opcional añade unos 2 GB.
 
 Pesos fijados en el manifiesto:
 
 | Archivo | Función | Tamaño publicado |
 |---|---|---:|
-| `minimax_h3_fl2va_bf16.safetensors` | Difusión FL2VA BF16 completa | 66.3 GB |
-| `qwen3vl_32b_minimax_h3_bf16.safetensors` | Encoder de texto e imagen BF16 | 51.5 GB |
-| `minimax_h3_video_vae_fp16.safetensors` | VAE de video | 5.21 GB |
-| `minimax_h3_audio_vae_fp32.safetensors` | VAE de audio | 605 MB |
+| `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | Difusión FL2VA INT8 ConvRot | 21 GB |
+| `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | Encoder Qwen3VL NVFP4-AWQ | 15.7 GB |
+| `minimax_h3_video_vae_int8_convrot.safetensors` | VAE de video INT8 ConvRot | 2.81 GB |
+| `minimax_h3_audio_vae_fp32.safetensors` | VAE de audio FP32 | 605 MB |
+| `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors` | LoRA Turbo opcional de 8 pasos | 1.96 GB |
 
-El manifiesto fija Python 3.12, PyTorch 2.11.0, torchvision 0.26.0 y torchaudio 2.11.0 con la rueda oficial CUDA 13.0; `TORCH_INDEX_URL` permite seleccionar otra rueda oficial compatible. PyTorch documenta estas ruedas CUDA y amplía soporte CUDA 13 a Blackwell y Hopper; comprueba la combinación concreta de driver, wheel y GPU antes de instalar. La tarjeta RTX PRO 6000 de 96 GB **no está validada aquí para BF16 a 15 s** y no se garantiza que una tarea quepa sin offload u optimización. H200 es una opción con más memoria; tampoco implica una validación de rendimiento. Haz una prueba controlada y mira el uso de VRAM antes de presupuestar cargas recurrentes.
+El manifiesto fija Python 3.12, PyTorch 2.11.0, torchvision 0.26.0 y torchaudio 2.11.0 con la rueda oficial CUDA 13.0; `TORCH_INDEX_URL` permite seleccionar otra rueda oficial compatible. PyTorch documenta estas ruedas CUDA y amplía soporte CUDA 13 a Blackwell y Hopper; comprueba la combinación concreta de driver, wheel y GPU antes de instalar. El encoder NVFP4 tiene aceleración nativa en Blackwell; otras GPU pueden cargarlo con dequantización y sin esa aceleración. Este worker no tiene validaciones de rendimiento ni de memoria para 10 s o 15 s en RTX PRO 6000 ni H200. La cuantización reduce el tamaño de los archivos, pero no implica una garantía sobre calidad o VRAM. Haz una prueba controlada y mira el uso de VRAM antes de presupuestar cargas recurrentes.
 
-El preflight muestra GPU, VRAM, driver, memoria del sistema y espacio libre; bloquea la descarga si no hay espacio para los pesos faltantes más margen de caché. Después de instalar, bootstrap verifica CUDA/BF16 en PyTorch y que `ffmpeg`/`ffprobe` estén disponibles. El preflight no mide el tiempo por video ni valida que 96 GB basten para la generación completa.
+El preflight muestra GPU, VRAM, driver, memoria del sistema y espacio libre; bloquea la descarga si no hay espacio para los archivos faltantes más margen de caché. Después de instalar, bootstrap verifica CUDA/BF16 en PyTorch y que `ffmpeg`/`ffprobe` estén disponibles. El preflight no mide el tiempo por video ni garantiza que una tarea quepa en la GPU.
 
 ## Duración, resolución y exportación
 
@@ -37,21 +38,27 @@ H3 acepta longitudes en la cuadrícula `17k + 5` cuadros a 24 fps. Para satisfac
 
 La resolución usa lados múltiplos de 32 y un lado corto de 768, dentro del canvas nativo máximo de 1344 × 768 (apaisado) o 768 × 1344 (vertical). El nodo nativo estira el primer cuadro para llenar el canvas; fotos muy panorámicas, muy altas o de otra relación de aspecto pueden deformarse. Recorta la imagen de origen a la relación de aspecto de salida si quieres conservar proporciones.
 
+El modo Base usa **12 pasos por defecto**. Para cambiar el valor predeterminado del worker, configura `IMAGINE_VIDEO_STEPS` como `8`, `12` o `20` antes de iniciarlo. Cada petición también puede incluir el campo multipart opcional `steps` con uno de esos valores para seleccionar los pasos del trabajo. La respuesta del trabajo incluye la selección. `GET /v1/health` anuncia `supported_steps: [8, 12, 20]` para que el cliente compruebe compatibilidad. Cualquier otro valor se rechaza.
+
+El campo multipart opcional `mode` acepta `base` o `turbo` y usa `base` por defecto. Turbo siempre usa 8 pasos y la LoRA `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors`; rechaza cualquier selección distinta de 8 y falla con HTTP 503 si falta el archivo. `GET /v1/health` incluye `turbo` en `supported_modes` solo cuando la LoRA está instalada. Base y Turbo usan el mismo stack cuantizado; cambiar de modo no descarga otro modelo base.
+
 ## Configuración inicial en una máquina CUDA
 
-Las instrucciones son deliberadamente explícitas: ejecutar `--install-runtime` instala paquetes y clona ComfyUI; ejecutar `--download-models` descarga unos 123 GB. No las ejecutes antes de revisar el presupuesto, el almacenamiento, la licencia y la ubicación física.
+Las instrucciones son deliberadamente explícitas: ejecutar `--install-runtime` instala paquetes y clona ComfyUI; ejecutar `--download-models` descarga unos 40 GB del stack cuantizado compartido por Base y Turbo. Añadir `--download-turbo` descarga la LoRA de unos 2 GB. No las ejecutes antes de revisar el presupuesto, el almacenamiento, la licencia y la ubicación física.
 
 ```bash
 cd imagine-video-worker
 scripts/bootstrap.sh --install-runtime
-scripts/bootstrap.sh --download-models
+scripts/bootstrap.sh --download-models --download-turbo
 ```
 
 Si Hugging Face solicita acceso al modelo, acepta la licencia en la cuenta autorizada y facilita `HF_TOKEN` solo en el entorno del proceso de descarga. No lo pegues en el repositorio, comandos guardados, historial de terminal ni archivo `.env`.
 
-La descarga valida los cuatro hashes SHA-256 del manifiesto. Si un hash no coincide, descarga fallará con el nombre exacto del archivo; elimina solo ese archivo corrupto de `ComfyUI/models/<ruta>` y vuelve a ejecutar `--download-models`. Los archivos parciales de caché de Hugging Face se pueden reanudar.
+La descarga valida los cuatro hashes SHA-256 del stack base y el hash de la LoRA cuando se solicita. Si un hash no coincide, descarga fallará con el nombre exacto del archivo; elimina solo ese archivo corrupto de `ComfyUI/models/<ruta>` y vuelve a ejecutar la descarga correspondiente. Los archivos parciales de caché de Hugging Face se pueden reanudar.
 
-Antes de iniciar, inyecta `IMAGINE_VIDEO_TOKEN` desde el gestor de secretos del sistema donde corre el servicio. Debe ser un token aleatorio largo. Para una sesión local de shell puede exportarse temporalmente en el entorno; no se guarda en Git. En una futura instancia Pod, usa el gestor de secretos del proveedor.
+Para habilitar la prueba Turbo después de instalar los pesos base, ejecuta `scripts/bootstrap.sh --download-turbo`. Primero comprueba que el stack base esté instalado; después descarga únicamente la LoRA opcional de aproximadamente 1.96 GB, fijada por revisión y SHA-256 en el manifiesto. No vuelve a descargar los modelos base. Para un Pod nuevo, usa `scripts/bootstrap.sh --download-models --download-turbo` una sola vez para instalar el stack compartido y la LoRA juntos.
+
+Antes de iniciar, inyecta `IMAGINE_VIDEO_TOKEN` desde el gestor de secretos del sistema donde corre el servicio. Debe ser un token aleatorio largo. Para una sesión local de shell puede exportarse temporalmente en el entorno; no se guarda en Git. En la Pod de servicio, usa el gestor de secretos del proveedor.
 
 ```bash
 export IMAGINE_VIDEO_TOKEN='(inyectado desde el gestor de secretos)'
@@ -91,25 +98,25 @@ printf 'url = "https://<HOST-HTTPS-DEL-WORKER>/v1/health"\nheader = "Authorizati
 
 La URL HTTP local del worker se puede usar en un entorno local de confianza. No publiques 8188 ni habilites la interfaz web de ComfyUI en Internet.
 
-## Runbook futuro: Pod privada con CUDA
+## Operación y recuperación: Pod privada con CUDA
 
-Este procedimiento es para una futura ejecución; actualmente Imagine conserva el worker local. La copia de código de GitHub todavía no se ha publicado. Sustituye `OWNER/PRIVATE_REPO` por la ruta real cuando exista.
+Este procedimiento documenta la Pod privada en la que corre el worker desplegado. Los pasos para crear una Pod y clonar el repositorio sirven para reconstruir la instalación desde cero. El código se aloja en el repositorio privado `ChristianCollaguazo/imagine-video-worker`.
 
 1. **Revisar licencia y región antes de crear la Pod o descargar pesos.** La licencia comunitaria de MiniMax H3 define como territorios excluidos Estados Unidos, Unión Europea, Reino Unido y República de Corea. El uso alojado también está sujeto a esa restricción; elige una región física fuera de esas zonas o consigue autorización previa de MiniMax. Confirma la licencia vigente y región concreta del proveedor, no solo la ubicación de quien opera la cuenta.
-2. **Preflight del costo.** El objetivo de gasto de este ensayo es **US$7 total**. Antes de iniciar, verifica en el panel el precio por hora vigente de la GPU, almacenamiento persistente, cargo mientras la Pod está detenida, descarga inicial de 123+ GB, transferencia y tiempo de arranque. Estima el total con margen para primer inicio y generación; si no cabe bajo US$7, no inicies. El precio cambia por región y disponibilidad; este README no cotiza ni reserva infraestructura.
-3. **Crear una Pod privada (Secure Cloud)** con acceso SSH privado, entorno Linux CUDA, volumen persistente montado en `/workspace` de al menos 200 GB. Considera RTX PRO 6000 96 GB como una opción no validada para 15 s BF16; H200 es opcional y más costoso. Configura el proveedor para no admitir acceso público directo por SSH y usa clave SSH controlada por ti. RunPod usa `https://<pod-id>-<port>.proxy.runpod.net` para un puerto HTTP expuesto; selecciona únicamente `8000/http` y la opción de SSH privada necesaria para administración. No expongas `8188`.
+2. **Preflight del costo.** El objetivo de gasto de este ensayo es **US$7 total**. Antes de iniciar, verifica en el panel el precio por hora vigente de la GPU, almacenamiento persistente, cargo mientras la Pod está detenida, descarga inicial de unos 42 GB si usarás Turbo, transferencia y tiempo de arranque. Estima el total con margen para primer inicio y generación; si no cabe bajo US$7, no inicies. El precio cambia por región y disponibilidad; este README no cotiza ni reserva infraestructura.
+3. **Recrear la Pod privada (Secure Cloud) solo si hace falta** con acceso SSH privado, entorno Linux CUDA, volumen persistente montado en `/workspace` de al menos 100 GB. La descarga completa del stack cuantizado con Turbo requiere alrededor de 42 GB más espacio para caché, runtime y resultados. Configura el proveedor para no admitir acceso público directo por SSH y usa clave SSH controlada por ti. RunPod usa `https://<pod-id>-<port>.proxy.runpod.net` para un puerto HTTP expuesto; selecciona únicamente `8000/http` y la opción de SSH privada necesaria para administración. No expongas `8188`.
 4. **Clonar el repositorio privado en el volumen**, con autenticación Git de solo lectura configurada como clave deploy de solo lectura en el gestor de secretos del proveedor. No añadas credenciales al código ni guardes la clave en el volumen.
 
    ```bash
    cd /workspace
-   git clone --depth 1 git@github.com:OWNER/PRIVATE_REPO.git imagine-video-worker
+   git clone --depth 1 git@github.com:ChristianCollaguazo/imagine-video-worker.git imagine-video-worker
    cd imagine-video-worker
    ```
 
-5. **Instalar una vez** en el volumen persistente con el mismo bootstrap anterior. ComfyUI y los pesos quedan bajo el árbol montado en `/workspace`; detén la Pod sin borrar el volumen para conservarlos. No coloques fotos de usuarios, resultados ni tokens en ese volumen.
-6. **Configurar secretos fuera del repositorio**: inyecta `IMAGINE_VIDEO_TOKEN` desde el gestor de secretos del proveedor. No copies `.env`, claves privadas, contraseñas ni tokens al directorio de trabajo. Usa un token nuevo para la instancia remota.
+5. **Instalar una vez** en el volumen persistente con el mismo bootstrap anterior: ejecuta `scripts/bootstrap.sh --install-runtime` y luego `scripts/bootstrap.sh --download-models --download-turbo` para descargar el único stack cuantizado compartido y la LoRA opcional. ComfyUI y los pesos quedan bajo el árbol montado en `/workspace`; detén la Pod sin borrar el volumen para conservarlos. No coloques fotos de usuarios, resultados ni tokens en ese volumen.
+6. **Configurar el entorno fuera del repositorio**: inyecta `IMAGINE_VIDEO_TOKEN` desde el gestor de secretos del proveedor. El muestreo base usa 12 pasos por defecto; configura `IMAGINE_VIDEO_STEPS=8`, `12` o `20` en el entorno de la Pod para cambiarlo. Si la LoRA opcional no se instaló en el paso anterior, `scripts/bootstrap.sh --download-turbo` comprueba el stack base y descarga solo la LoRA de aproximadamente 1.96 GB. En una Pod que ya tiene ese stack, no vuelvas a ejecutar `--download-models` para habilitar Turbo. No copies `.env`, claves privadas, contraseñas ni tokens al directorio de trabajo. Usa un token nuevo para la instancia remota.
 7. **Limitar red**: deja el servidor ComfyUI `8188` accesible solo por loopback; expón el servicio del worker por el endpoint HTTPS del proveedor en `8000`; no abras otros puertos de aplicación. Mantén SSH privado para la administración. Revisa reglas de red y URL antes de enviar una foto.
-8. **Arrancar y comprobar salud**, hacer validación aislada con la misma foto autorizada: genera primero 10 s y verifica MP4 exacto de 240 cuadros, 24 fps y H.264; ACK/purga ese trabajo. Luego genera 15 s y verifica 360 cuadros, 24 fps y H.264; ACK/purga ese trabajo. Incluye la descarga fría y ambos trabajos en el límite total de US$7; mira el gasto entre trabajos y no inicies el segundo si la proyección supera el límite. La URL HTTPS es `https://<pod-id>-8000.proxy.runpod.net`. Si hay error CUDA/OOM, detén el servicio y la Pod; no cambies a pesos cuantizados/Turbo en este despliegue BF16.
+8. **Arrancar y comprobar salud**, hacer validación aislada con la misma foto autorizada: genera primero 10 s en modo Base y verifica MP4 exacto de 240 cuadros, 24 fps y H.264; ACK/purga ese trabajo. Luego, si el presupuesto lo permite, compara un video Turbo de 10 s con el mismo prompt/foto y verifica el MP4; la calidad y la velocidad de la comparación son experimentales y no están garantizadas. Incluye la descarga fría y los trabajos en el límite total de US$7; mira el gasto entre trabajos y no inicies el siguiente si la proyección supera el límite. La URL HTTPS es `https://<pod-id>-8000.proxy.runpod.net`. Si hay error CUDA/OOM, detén el servicio y la Pod.
 9. **Conectar Imagine local al Pod**: en el archivo raíz `Imagine/.env` (ignorado por Git), añade `IMAGINE_VIDEO_URL=https://<pod-id>-8000.proxy.runpod.net` y `IMAGINE_VIDEO_TOKEN=<el mismo secreto inyectado en la Pod>`. Luego detén la app local y arráncala de nuevo con `./start_wardrobe_app.command`; el backend lee `.env` durante el arranque. Comprueba que la salud HTTPS con token responde, inicia un único video de prueba desde Imagine y confirma que el MP4 se importa localmente. Mantén las claves solo en el gestor de secretos y `.env` local.
 10. **Cerrar después de cada sesión**: ejecuta `scripts/stop.sh`, comprueba `GET /v1/health` deja de responder con una petición Bearer que tenga timeout, detén la Pod desde el panel y verifica que la GPU ya no factura. Revisa el costo acumulado cada vez que inicias o detienes; una terminal cerrada no detiene la facturación. La persistencia o costo del volumen puede continuar al parar la Pod; confirma los cargos en el panel.
 11. **Limpieza final**: descarga solo los MP4 que quieras conservar; luego elimina la Pod y, si ya no necesitas el caché, borra el volumen persistente desde el panel. Comprueba que desaparecieron los recursos facturables. La limpieza normal de trabajos elimina imagen, video e intermedios temporales; borrar el volumen además borra los pesos que tendrías que volver a descargar.
@@ -125,8 +132,9 @@ Este procedimiento es para una futura ejecución; actualmente Imagine conserva e
 ## Fuentes oficiales fijadas
 
 - [Guía oficial de MiniMax H3 en ComfyUI](https://github.com/Comfy-Org/docs/blob/main/tutorials/video/minimax/minimax-h3-native.mdx): 768 px en el lado corto, 1344 × 768 nativo, cuadro `17k + 5`, nodos nativos, Turbo opcional.
+- [Plantilla oficial H3 I2V de ComfyUI](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_i2v.json): LoRA Lightning opcional de 8 pasos para Turbo.
 - [ComfyUI v0.34.0](https://github.com/Comfy-Org/ComfyUI/releases/tag/v0.34.0): release de core con nodos MiniMax H3.
-- [Manifiesto de archivos Comfy-Org](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main): pesos BF16 y VAEs usados por este flujo.
+- [Manifiesto de archivos Comfy-Org](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main): stack FL2VA INT8 ConvRot, encoder NVFP4-AWQ y VAE INT8 usados por este flujo.
 - [Licencia comunitaria oficial MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE): alcance territorial, restricciones y condiciones para servicios alojados.
 - [PyTorch: instalación local](https://pytorch.org/get-started/locally/) y [versiones CUDA anteriores](https://pytorch.org/get-started/previous-versions/): elige la rueda adecuada para el driver y GPU concretos.
 - [PyTorch: soporte CUDA 13 y Blackwell](https://dev-discuss.pytorch.org/t/introducing-cuda-13-2-and-deprecating-cuda-12-8-release-2-12/3337).

@@ -31,7 +31,7 @@ class ComfyClient:
         missing = required.difference(available)
         if missing:
             raise RuntimeError("Required ComfyUI nodes are unavailable")
-        return True
+        return set(available)
 
     async def upload(self, path, name: str, content_type: str = "image/jpeg") -> str:
         with path.open("rb") as image:

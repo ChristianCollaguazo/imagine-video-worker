@@ -1,15 +1,32 @@
-"""Native ComfyUI MiniMax H3 FL2VA workflow (full BF16, no turbo/LoRA)."""
+"""Native ComfyUI MiniMax H3 FL2VA base workflow and optional 8-step Turbo variant."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 _manifest = json.loads((Path(__file__).resolve().parents[1] / "config/model-manifest.json").read_text())
 _models = {item["id"]: item["name"] for item in _manifest["models"]}
+_optional_models = {item["id"]: item["name"] for item in _manifest.get("optional_models", [])}
 MODEL = _models["fl2va_model"]
 CLIP = _models["text_encoder"]
 VIDEO_VAE = _models["video_vae"]
 AUDIO_VAE = _models["audio_vae"]
+TURBO_LORA = _optional_models["fl2v_turbo_lora_8step"]
+DEFAULT_STEPS = 12
+ALLOWED_STEPS = (8, 12, 20)
+
+
+def sampling_steps(configured: int | None = None) -> int:
+    """Resolve a supported Base sampling count, defaulting to 12 steps."""
+    raw = os.environ.get("IMAGINE_VIDEO_STEPS", str(DEFAULT_STEPS)) if configured is None else configured
+    try:
+        steps = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("IMAGINE_VIDEO_STEPS must be 8, 12, or 20") from exc
+    if steps not in ALLOWED_STEPS:
+        raise ValueError("IMAGINE_VIDEO_STEPS must be 8, 12, or 20")
+    return steps
 
 
 def canvas_for_image(width: int, height: int) -> tuple[int, int]:
@@ -43,6 +60,7 @@ def build_workflow(
     image_width: int = 16,
     image_height: int = 9,
     job_id: str | None = None,
+    steps: int | None = None,
 ) -> dict:
     """Build the ComfyUI API prompt graph for one image plus one prompt."""
     if not prompt.strip():
@@ -51,6 +69,7 @@ def build_workflow(
         raise ValueError("image_filename must be the ComfyUI uploaded filename")
     width, height = canvas_for_image(image_width, image_height)
     length = model_frame_count(duration_seconds)
+    steps = sampling_steps(steps)
     graph = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL, "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": CLIP, "type": "minimax", "device": "default"}},
@@ -62,7 +81,7 @@ def build_workflow(
             "width": width, "height": height, "length": length,
             "first_frame": ["5", 0],
         }},
-        "7": {"class_type": "BasicScheduler", "inputs": {"model": ["1", 0], "scheduler": "simple", "steps": 20, "denoise": 1.0}},
+        "7": {"class_type": "BasicScheduler", "inputs": {"model": ["1", 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
         "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
         "9": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}},
         "10": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["6", 0]}},
@@ -79,4 +98,28 @@ def build_workflow(
             "format.codec.encoding": "re-encode", "format.codec.encoding.crf": 18,
         }},
     }
+    return graph
+
+
+def build_turbo_workflow(
+    prompt: str,
+    image_filename: str,
+    duration_seconds: int,
+    seed: int,
+    image_width: int = 16,
+    image_height: int = 9,
+    job_id: str | None = None,
+) -> dict:
+    """Build the separate official 8-step LoRA I2V experiment graph."""
+    graph = build_workflow(
+        prompt, image_filename, duration_seconds, seed,
+        image_width, image_height, job_id, steps=8,
+    )
+    graph["16"] = {
+        "class_type": "LoraLoaderModelOnly",
+        "inputs": {"model": ["1", 0], "lora_name": TURBO_LORA, "strength_model": 1.0},
+    }
+    graph["7"]["inputs"]["model"] = ["16", 0]
+    graph["7"]["inputs"]["steps"] = 8
+    graph["10"]["inputs"]["model"] = ["16", 0]
     return graph
