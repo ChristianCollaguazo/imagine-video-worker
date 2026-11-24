@@ -8,10 +8,16 @@ boot_started=$SECONDS
 export IMAGINE_VIDEO_RUN_ROOT=/tmp/imagine-video-worker
 # Fail fast on incompatible GPU before copying large weights.
 .venv-comfy/bin/python -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable"; assert torch.cuda.is_bf16_supported(), "BF16 unavailable"; print(torch.cuda.get_device_name(0), flush=True)'
-stage_started=$SECONDS
-.venv-comfy/bin/python docker/stage_models.py
-if [[ "${IMAGINE_DEBUG_METRICS:-0}" == "1" ]]; then
-  printf 'imagine_metric {"event":"model_staging_finished","seconds":%s}\n' "$((SECONDS-stage_started))"
+if .venv-comfy/bin/python docker/stage_models.py; then
+  :
+else
+  stage_status=$?
+  if [[ "${IMAGINE_MODEL_STORAGE_MODE:-local}" == "direct" ]]; then
+    echo "H3 model preparation failed in direct storage mode. Check the Global Volume mount, file readability, and mmap support; for one diagnostic retry, set IMAGINE_MODEL_STORAGE_MODE=local. No automatic fallback was applied." >&2
+  else
+    echo "H3 model preparation failed; verify the model volume and staging configuration." >&2
+  fi
+  exit "$stage_status"
 fi
 cleanup() {
   bash scripts/stop.sh || true
@@ -29,7 +35,11 @@ while true; do
   for service in comfyui worker; do
     pid=$(cat "$IMAGINE_VIDEO_RUN_ROOT/pids/$service.pid")
     if ! kill -0 "$pid" 2>/dev/null || [[ $(ps -p "$pid" -o stat=) == Z* ]]; then
-      echo "$service exited; stopping container" >&2
+      if [[ "$service" == "comfyui" && "${IMAGINE_MODEL_STORAGE_MODE:-local}" == "direct" ]]; then
+        echo "ComfyUI exited while direct model storage was enabled; for one diagnostic retry, set IMAGINE_MODEL_STORAGE_MODE=local. No automatic fallback was applied." >&2
+      else
+        echo "$service exited; stopping container" >&2
+      fi
       exit 1
     fi
   done

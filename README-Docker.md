@@ -1,4 +1,4 @@
-# H3 Turbo optimizado
+# H3 Turbo optimizado — almacenamiento directo
 
 Esta imagen usa MiniMax H3 FL2VA INT8 ConvRot, el encoder Qwen3VL NVFP4 y la
 LoRA Turbo de ocho pasos del MVP 1. El flujo predeterminado mantiene 24 FPS,
@@ -21,8 +21,8 @@ activo y la sesión de Docker Hub iniciada:
 ```bash
 docker buildx build --platform linux/amd64 \
   --build-arg IMAGINE_SOURCE_COMMIT="$(git rev-parse HEAD)" \
-  -t christiancollaguazo/imagine-video-worker:h3-optimized-v1 --push .
-docker buildx imagetools inspect christiancollaguazo/imagine-video-worker:h3-optimized-v1
+  -t christiancollaguazo/imagine-video-worker:h3-optimized-v2 --push .
+docker buildx imagetools inspect christiancollaguazo/imagine-video-worker:h3-optimized-v2
 ```
 
 En el `.env` local de Imagine, configura la URL del Pod y conserva el token
@@ -37,7 +37,7 @@ IMAGINE_VIDEO_URL=https://POD_ID-8000.proxy.runpod.net
 
 Selecciona una RTX PRO 6000 Blackwell de 96 GB en Secure Cloud con driver
 CUDA 13.2, Container Disk de 100 GB y la imagen
-`christiancollaguazo/imagine-video-worker:h3-optimized-v1`. Asocia el Global
+`christiancollaguazo/imagine-video-worker:h3-optimized-v2`. Asocia el Global
 Volume existente en `/workspace-global`. Expón únicamente HTTP 8000 y deja
 vacío el comando de inicio.
 
@@ -46,14 +46,74 @@ IMAGINE_VIDEO_TOKEN={{ RUNPOD_SECRET_imagine_video_token }}
 IMAGINE_GLOBAL_MOUNT=/workspace-global
 IMAGINE_DOWNLOAD_MODELS=0
 IMAGINE_DEBUG_METRICS=1
-IMAGINE_H3_VRAM_PROFILE=auto
-IMAGINE_H3_AUDIO=1
+IMAGINE_H3_VRAM_PROFILE=high
+IMAGINE_H3_AUDIO=0
+IMAGINE_MODEL_STORAGE_MODE=direct
+IMAGINE_MODEL_VERIFY_MODE=cached
 ```
 
-El staging mueve unos 42.1 GB (39.2 GiB) al disco local. Calcula SHA-256 en
-la misma pasada de copia y verifica cualquier copia local reutilizada. Si
-falta un archivo o falla su verificación, el worker se detiene durante el
-arranque. Los cinco archivos ya deben existir bajo `imagine-h3-turbo/models/`.
+Los cinco archivos deben existir bajo `imagine-h3-turbo/models/`. El modo
+predeterminado `local` mantiene el comportamiento anterior: copia los modelos
+al disco local del contenedor y valida SHA-256. `direct` crea enlaces
+simbólicos en las rutas estándar de ComfyUI que apuntan a los archivos del
+Global Volume; no copia ni modifica los pesos. Si falta un modelo o falla una
+comprobación, el arranque falla. No hay cambio silencioso de `direct` a `local`.
+No se implementó `auto`: la accesibilidad de un archivo no permite inferir su
+rendimiento ni la compatibilidad real de mmap. Si `direct` informa que una ruta
+local ya contiene un archivo que no es un enlace válido, usa una Pod nueva con
+disco local limpio o selecciona `local`; no se reemplaza automáticamente.
+
+`IMAGINE_MODEL_VERIFY_MODE` controla la integridad. `local` siempre calcula
+SHA-256 en la pasada de copia; para archivos locales existentes, `full` y
+`cached` actualmente vuelven a calcular SHA-256, mientras `size` comprueba el
+tamaño. La caché evita el hash completo solo en modo `direct`:
+
+| Valor | Comprobación |
+|---|---|
+| `full` (predeterminado) | SHA-256 completo de cada peso; `direct` vuelve a leer los pesos persistentes. |
+| `cached` | En modo `direct`, reutiliza solo una verificación SHA-256 anterior que coincide con el manifiesto y metadatos observados. Un fallo de caché realiza una verificación completa antes de guardar un recibo nuevo. |
+| `size` | Comprueba existencia y tamaño exacto esperado; no es una comprobación criptográfica. |
+
+En modo `direct`, la verificación cacheada evita releer los 40 GiB únicamente
+si existe un recibo válido de una verificación SHA-256 completa previa. La
+primera preparación `direct+cached` puede por tanto tardar lo mismo que `full`;
+las siguientes usan el recibo si los metadatos siguen coincidiendo. Metadatos idénticos no
+demuestran que el contenido no haya cambiado; usa `full` cuando necesites
+validar el contenido actual. Los recibos guardan solo datos técnicos de
+verificación en Global Volume; cada recibo válido se guarda en un archivo
+inmutable y no se sobrescribe. Un recibo parcial o ilegible se ignora. Los
+modelos deben haberse validado íntegramente al descargarse.
+
+El modo `direct` hace una comprobación básica de que los archivos admiten un
+mapa de solo lectura y lee bytes al inicio y al final; no prueba la carga completa de tensores
+ni el rendimiento sostenido de lecturas aleatorias. ComfyUI v0.34.0 carga
+`safetensors` con `safe_open` y obtiene sus tensores desde el archivo. Si
+`comfy-aimdo` está activo, usa su propio cargador basado en mapas de memoria. El
+argumento `--disable-mmap` de esa versión copia cada tensor después de
+`get_tensor`; no garantiza que la apertura inicial evite mmap. No lo uses como
+prueba de que el almacenamiento directo será compatible o más rápido.
+[Código del cargador en v0.34.0](https://github.com/Comfy-Org/ComfyUI/blob/v0.34.0/comfy/utils.py) y
+[argumentos de CLI](https://github.com/Comfy-Org/ComfyUI/blob/v0.34.0/comfy/cli_args.py).
+
+RunPod describe Global Volumes como almacenamiento respaldado por object
+storage, pensado para modelos y otros datos que se escriben poco y se leen en
+despliegues sucesivos. RunPod advierte que no ofrece semántica POSIX completa
+ni equivale a un volumen regional de alto rendimiento; tampoco ofrece
+renombrado atómico ni hard links. Por eso, no se puede
+deducir solo desde el contenedor si mmap, acceso aleatorio, `stat` y la caché de
+páginas tendrán el comportamiento o la velocidad deseados. [Detalles de RunPod
+Global Volumes](https://www.runpod.io/blog/global-volumes-beta) y [limitaciones
+del almacenamiento object-backed](https://www.runpod.io/blog/global-volumes-serverless-beta).
+
+El acceso directo puede reducir el tiempo antes de que la API esté lista y a
+la vez aumentar el tiempo de carga inicial o la primera generación. Los datos
+leídos pueden quedar en la caché de páginas del sistema operativo; eso puede
+ayudar en accesos posteriores mientras el proceso y la Pod sigan activos,
+pero no se promete que el contenido de una Global Volume permanezca cacheado
+entre Pods. [Descripción del page cache de Linux](https://docs.kernel.org/admin-guide/mm/concepts.html#page-cache).
+La carga completa de los tensores a CPU/RAM puede evitar lecturas repetidas
+desde el almacenamiento remoto, pero también requiere memoria y podría elevar
+el pico de RAM. No se sustituye mmap por una carga completa automáticamente.
 
 En una terminal del Pod, consulta salud y uso de recursos:
 
@@ -62,16 +122,29 @@ printf 'header = "Authorization: Bearer %s"\n' "$IMAGINE_VIDEO_TOKEN" |
   curl -fsS -K - http://127.0.0.1:8000/v1/health
 nvidia-smi --query-gpu=memory.total,memory.used,utilization.gpu,power.draw,temperature.gpu --format=csv -l 2
 cat /sys/fs/cgroup/memory.current
+findmnt -T /workspace-global/imagine-h3-turbo/models
+readlink -f /opt/imagine-video-worker/ComfyUI/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+stat -c '%s %Y %i %n' /workspace-global/imagine-h3-turbo/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
 ```
 
-En **Logs** de RunPod, busca `imagine_metric`. Los campos incluyen arranque,
-staging, carga de nodos, codificación conjunta de imagen y prompt, intervalos
-de difusión, VAE de video y audio, exportación y tiempo total. La primera
-ejecución del proceso se marca como fría. ComfyUI inicializa algunos pesos
-dentro de la primera operación que los usa. Los eventos no aíslan esas cargas
-de las operaciones ni miden transferencias CPU/GPU por separado. El muestreo
-de memoria puede omitir picos entre muestras. La duración de cada paso es una
-aproximación de reloj de pared a partir de los eventos de ComfyUI.
+`readlink -f` confirma que el enlace de ComfyUI resuelve al archivo
+persistent; `findmnt` y `stat` registran el tipo de montaje y metadatos que
+RunPod presenta a la Pod. Estos comandos no miden acceso aleatorio ni prueban
+que todos los fallos de mmap estén cubiertos. No ejecutes una lectura completa
+de 40 GiB solo para diagnosticar un arranque: usa el modo `full` cuando
+realmente quieras comprobar cada byte.
+
+En **Logs** de RunPod, busca `imagine_metric`. El evento
+`model_staging_finished` identifica modos solicitados y efectivos, tiempos de
+montaje, verificación, copia, prueba básica de mmap y configuración de rutas,
+bytes copiados/hasheados, recuentos de archivos y el fingerprint del manifiesto.
+`comfy_available`, `api_available` y `container_ready` marcan disponibilidad;
+`model_loader_node`, `generation_started`, `generation_finished` y
+`resource_peaks` describen cargas observadas y generaciones. ComfyUI inicializa
+algunos pesos dentro de la primera operación que los usa. Los tiempos de nodo
+son aproximaciones de reloj de pared y no aíslan transferencias CPU/GPU. El
+muestreo de memoria puede omitir picos entre muestras. Las métricas contienen
+datos técnicos; no incluyen prompts, imágenes, videos ni tokens.
 
 - `IMAGINE_H3_VRAM_PROFILE=high` prueba `--highvram` con una reserva de
   12 GiB en una GPU con al menos 90 GiB visibles. El perfil cambia la política
@@ -108,16 +181,42 @@ proceso. El apagado del contenedor libera estas cachés. La eliminación de
 archivos es lógica y depende también de la gestión del almacenamiento del
 proveedor.
 
-Prueba `turbo-v1`, `h3-optimized-v1` y `lightwan-v1` en Pods de la
-misma clase y precio. Usa imágenes y prompts idénticos. Mide el tiempo desde
-inicio hasta salud, desde POST hasta completado y hasta descarga. Después de
-una ejecución fría, repite tres ejecuciones por duración y perfil en el mismo
-Pod. Prueba un solo cambio H3 por vez. Registra mediana, rango, memoria máxima,
-tiempos de etapas disponibles y costo de cómputo como
-`tarifa por hora × segundos facturados / 3600`. Registra por separado la
-facturación de almacenamiento. El tag original permite medir tiempos externos
-y recursos con `nvidia-smi`. La API original asigna semillas aleatorias.
-Inspecciona el archivo con:
+La métrica principal es el tiempo externo desde iniciar el despliegue hasta
+obtener el primer MP4. Compara `h3-optimized-v1` con `h3-optimized-v2` en Pods
+separados de la misma clase, manteniendo el mismo Global Volume, GPU, imagen
+del modelo, prompt, resolución, duración, FPS y parámetros. Mantén
+`IMAGINE_H3_VRAM_PROFILE=high` y `IMAGINE_H3_AUDIO=0` en ambas. Conserva
+`turbo-v1` como referencia aparte; no aísla el cambio de almacenamiento.
+
+Para separar el efecto del almacenamiento y el de la verificación, registra
+estos casos:
+
+| Medición | v1 local | v2 local + full | v2 direct + full | v2 direct + cached |
+|---|---:|---:|---:|---:|
+| Deploy externo → primer MP4 | Pendiente | Pendiente | Pendiente | Pendiente |
+| API disponible (`container_ready`) | 650 s observado* | Pendiente | Pendiente | Pendiente |
+| Preparación (`model_staging_finished`) | 634 s observado* | Pendiente | Pendiente | Pendiente |
+| Primera generación y cargas iniciales | Pendiente | Pendiente | Pendiente | Pendiente |
+| Generaciones posteriores | Pendiente | Pendiente | Pendiente | Pendiente |
+| Pico de VRAM y RAM | Pendiente | Pendiente | Pendiente | Pendiente |
+| Disco local ocupado | Pendiente | Pendiente | Pendiente | Pendiente |
+| Costo de sesión y almacenamiento | Pendiente | Pendiente | Pendiente | Pendiente |
+
+`*` Los 634 s de staging y 650 s hasta API son observaciones anteriores de v1;
+`container_ready` cuenta desde dentro del contenedor y no incluye descarga o
+extracción de la imagen. Cronometra además deploy→salud, POST→completado y
+descarga del MP4. El primer `direct+cached` puede ser un fallo de caché y leer
+y calcular hash de todos los modelos; anótalo como cache miss. Repite una
+sesión fría en una Pod nueva y, después, al menos tres generaciones en la misma
+Pod para medir la primera carga y las posteriores. Registra mediana y rango,
+costo de cómputo (`tarifa por hora × segundos facturados / 3600`) y costo de
+almacenamiento por separado.
+
+El worker asigna semillas aleatorias y la API actual no permite fijar una.
+No cambies el workflow ni la API para introducir una semilla en esta
+comparación. Usa varias ejecuciones, evalúa calidad visual a ciegas y registra
+esta limitación: las salidas no estarán emparejadas con la misma secuencia
+aleatoria. Inspecciona el archivo con:
 
 ```bash
 ffprobe -v error -show_entries stream=codec_type,width,height,avg_frame_rate,nb_frames:format=duration -of json salida.mp4

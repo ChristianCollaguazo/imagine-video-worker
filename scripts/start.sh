@@ -103,6 +103,7 @@ run_comfy() {
     --database-url sqlite:///:memory: \
     --listen 127.0.0.1 --port 8188 --disable-auto-launch --disable-metadata
 }
+comfy_start_started=$SECONDS
 if [[ "${IMAGINE_DEBUG_METRICS:-0}" == "1" ]]; then
   run_comfy > >(log_comfy) 2>&1 &
 else
@@ -117,8 +118,12 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 if [[ "$healthy" -ne 1 ]]; then echo "ComfyUI did not become healthy" >&2; exit 1; fi
+if [[ "${IMAGINE_DEBUG_METRICS:-0}" == "1" ]]; then
+  printf 'imagine_metric {"event":"comfy_available","seconds":%s}\n' "$((SECONDS-comfy_start_started))"
+fi
 
 # Provider ingress must terminate TLS and expose only this service on HTTPS port 8000.
+api_start_started=$SECONDS
 PYTHONPATH="$ROOT" "$ROOT/.venv-comfy/bin/uvicorn" app.main:app \
   --host 0.0.0.0 --port 8000 --no-access-log 2>/dev/null &
 worker_pid=$!
@@ -137,6 +142,9 @@ done
 if [[ "$healthy" -ne 1 ]]; then
   echo "Worker did not become healthy; services stopped" >&2
   exit 1
+fi
+if [[ "${IMAGINE_DEBUG_METRICS:-0}" == "1" ]]; then
+  printf 'imagine_metric {"event":"api_available","seconds":%s}\n' "$((SECONDS-api_start_started))"
 fi
 trap - EXIT
 echo "Worker ready at http://127.0.0.1:8000/v1/health (expose only through HTTPS provider ingress)."

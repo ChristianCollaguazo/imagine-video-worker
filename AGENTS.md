@@ -5,9 +5,18 @@ This branch contains H3 only. The MVP 1 base is commit `1a0eb25`, image tag
 
 - `app/main.py` owns the single-slot Bearer API and job lifecycle. `app/comfy.py`
   communicates with localhost ComfyUI. `app/workflow.py` builds the native H3 graph.
-- `docker/entrypoint.sh` stages models and supervises the services started by
+- `docker/entrypoint.sh` prepares models and supervises services from
   `scripts/start.sh`. `docker/stage_models.py` reads the five manifest-pinned
-  weights from `/workspace-global/imagine-h3-turbo/models` and verifies local copies.
+  weights from `/workspace-global/imagine-h3-turbo/models`.
+- `IMAGINE_MODEL_STORAGE_MODE=local|direct` defaults to `local`. Direct mode
+  uses per-file symlinks into Global Volume and fails closed; no silent local
+  copy fallback. `IMAGINE_MODEL_VERIFY_MODE=full|cached|size` defaults to
+  `full`; only `full` is cryptographic verification on each run. Cached receipts
+  are metadata-based and cannot detect same-size changes with unchanged metadata.
+- Global Volume is object-backed and does not promise full POSIX or high
+  throughput semantics. Treat mmap, remote random reads, `stat` freshness, and
+  page-cache benefits as unverified until measured in RunPod. See the storage
+  section and A/B plan in `README-Docker.md`.
 - Keep the default INT8/NVFP4 weights, eight-step Turbo LoRA, 24 fps and native
   frame geometry. Benchmark optional VRAM/audio settings before promoting them.
 - Keep media, prompts, credentials and diagnostics out of Global Volume and of

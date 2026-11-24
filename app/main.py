@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from .comfy import ComfyClient, new_client_id
+from .comfy import ComfyClient, ModelLoaderError, new_client_id
 from .workflow import SUPPORTED_DURATIONS, VIDEO_FPS, TURBO_LORA, build_turbo_workflow, build_workflow, sampling_steps
 
 TOKEN = os.environ.get("IMAGINE_VIDEO_TOKEN", "")
@@ -211,7 +211,10 @@ async def _run_job(job_id: str):
         previous_step: float | None = None
         node_seconds: dict[str, float] = {}
         step_seconds: list[float] = []
-        _metric("generation_started", generation=generation_number, warm=generation_number > 1)
+        _metric(
+            "generation_started", generation=generation_number, warm=generation_number > 1,
+            generation_state="initial" if generation_number == 1 else "subsequent",
+        )
         job["status"], job["stage"], job["progress"] = "running", "uploading_photo", None
         try:
             content_type = {".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}[job["input_path"].suffix]
@@ -276,6 +279,13 @@ async def _run_job(job_id: str):
                 nodes={COMFY_NODE_LABELS[node]: round(seconds, 3) for node, seconds in node_seconds.items() if node in COMFY_NODE_LABELS},
                 diffusion_step_seconds=step_seconds,
             )
+            for node in ("1", "2", "3", "4", "16"):
+                if node in node_seconds:
+                    _metric(
+                        "model_loader_node", loader=COMFY_NODE_LABELS[node],
+                        seconds=round(node_seconds[node], 3), generation=generation_number,
+                        load_state="initial" if generation_number == 1 else "subsequent",
+                    )
             if job["cancel_event"].is_set() or history is None:
                 return
             job["stage"] = "collecting_result"
@@ -354,7 +364,7 @@ async def _run_job(job_id: str):
             _metric("generation_finished", status="completed", seconds=round(time.perf_counter() - generation_started, 3), generation=generation_number)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             if not job["cancel_event"].is_set():
                 stopped = True
                 if job.get("prompt_id"):
@@ -372,7 +382,11 @@ async def _run_job(job_id: str):
                     _cleanup(job)
                 else:
                     job["remote_cleanup_pending"] = True
-                job.update(status="failed", stage="failed", progress=None, error="Video generation failed. Please try again.", completed_at=time.time())
+                public_error = "Video generation failed. Please try again."
+                if isinstance(exc, ModelLoaderError):
+                    public_error = "Model loading failed. Check model storage, permissions, file completeness, and mmap compatibility."
+                    _metric("model_loader_failure", generation=generation_number, loader=exc.loader, kind=exc.kind)
+                job.update(status="failed", stage="failed", progress=None, error=public_error, completed_at=time.time())
                 _metric("generation_finished", status="failed", seconds=round(time.perf_counter() - generation_started, 3), generation=generation_number)
         finally:
             if resource_task:

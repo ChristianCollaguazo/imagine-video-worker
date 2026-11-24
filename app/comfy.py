@@ -9,6 +9,67 @@ from urllib.parse import urlencode
 import httpx
 import websockets
 
+MODEL_LOADER_TYPES = {
+    "UNETLoader": "diffusion_model_loader",
+    "CLIPLoader": "text_encoder_loader",
+    "VAELoader": "vae_loader",
+    "LoraLoaderModelOnly": "turbo_lora_loader",
+}
+MODEL_LOADER_NODES = {
+    "1": "diffusion_model_loader",
+    "2": "text_encoder_loader",
+    "3": "video_vae_loader",
+    "4": "audio_vae_loader",
+    "16": "turbo_lora_loader",
+}
+
+
+class ModelLoaderError(RuntimeError):
+    """Sanitized classification for known model-file/mmap loader failures."""
+
+    def __init__(self, loader: str, kind: str):
+        self.loader = loader
+        self.kind = kind
+        super().__init__("Model loading failed; check model storage, permissions, and mmap compatibility")
+
+
+def _model_loader_failure(data: dict) -> ModelLoaderError | None:
+    """Classify only known loader nodes and explicit mmap/file access failures."""
+    node_type = data.get("node_type")
+    loader = MODEL_LOADER_TYPES.get(node_type)
+    if not loader:
+        loader = MODEL_LOADER_NODES.get(str(data.get("node_id") or data.get("node") or ""))
+    if not loader:
+        return None
+    details = " ".join(
+        value for value in (data.get("exception_type"), data.get("exception_message"))
+        if isinstance(value, str)
+    ).lower()
+    if any(marker in details for marker in (
+        "mmap", "memory map", "failed to map", "cannot map", "cannot allocate memory",
+    )):
+        return ModelLoaderError(loader, "mmap")
+    if any(marker in details for marker in (
+        "safetensors", "permission denied", "input/output error", "file too short",
+        "unexpected eof", "no such file", "file not found", "invalid header", "not a regular file",
+    )):
+        return ModelLoaderError(loader, "file_access")
+    return None
+
+
+def _raise_history_loader_failure(history: dict, prompt_id: str):
+    record = history.get(prompt_id, {})
+    status = record.get("status", {}) if isinstance(record, dict) else {}
+    messages = status.get("messages", []) if isinstance(status, dict) else []
+    for item in messages:
+        if not isinstance(item, (list, tuple)) or len(item) < 2 or item[0] != "execution_error":
+            continue
+        data = item[1]
+        if isinstance(data, dict):
+            loader_error = _model_loader_failure(data)
+            if loader_error:
+                raise loader_error
+
 
 class ComfyClient:
     def __init__(self, base_url: str, ws_url: str):
@@ -63,6 +124,7 @@ class ComfyClient:
                     except asyncio.TimeoutError:
                         history = await self.history(prompt_id)
                         if prompt_id in history:
+                            _raise_history_loader_failure(history, prompt_id)
                             return history[prompt_id]
                         continue
                     if not isinstance(raw, str):
@@ -81,6 +143,9 @@ class ComfyClient:
                             report({"node": node, "stage": stage})
                     elif message.get("type") == "execution_error":
                         report({"node_started": None})
+                        loader_error = _model_loader_failure(data)
+                        if loader_error:
+                            raise loader_error
                         raise RuntimeError("ComfyUI execution failed")
                     elif message.get("type") == "executing" and data.get("node") is None:
                         report({"node_started": None})
@@ -90,6 +155,7 @@ class ComfyClient:
                                 return None
                             history = await self.history(prompt_id)
                             if prompt_id in history:
+                                _raise_history_loader_failure(history, prompt_id)
                                 return history[prompt_id]
                             await asyncio.sleep(1)
                         raise RuntimeError("ComfyUI history was not committed after execution")
@@ -99,6 +165,7 @@ class ComfyClient:
                     return None
                 history = await self.history(prompt_id)
                 if prompt_id in history:
+                    _raise_history_loader_failure(history, prompt_id)
                     return history[prompt_id]
                 await asyncio.sleep(2)
         raise TimeoutError("ComfyUI did not complete the job in time")
