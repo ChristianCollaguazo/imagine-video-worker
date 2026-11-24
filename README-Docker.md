@@ -3,7 +3,9 @@
 Esta imagen usa MiniMax H3 FL2VA INT8 ConvRot, el encoder Qwen3VL NVFP4 y la
 LoRA Turbo de ocho pasos del MVP 1. El flujo predeterminado mantiene 24 FPS,
 el lienzo con lado corto de 768 px y el audio. ComfyUI genera 243 o 362
-cuadros y FFmpeg exporta 240 o 360 para entregar 10 o 15 segundos.
+cuadros y FFmpeg exporta 240 o 360 para entregar 10 o 15 segundos. El
+Dockerfile se basa en el digest linux/amd64 de `turbo-v1` para conservar
+las versiones exactas del runtime que ya se usó en RunPod.
 
 ## Mac
 
