@@ -25,6 +25,7 @@ RETENTION_SECONDS = 15 * 60
 MAX_PIXELS = 40_000_000
 LONG_VIDEO_ENABLED = os.environ.get("IMAGINE_LIGHTWAN_ENABLE_LONG_VIDEO", "0") == "1"
 FPS = 16
+SUPPORTED_DURATIONS = tuple(range(3, 31))
 DEBUG_METRICS = os.environ.get("IMAGINE_DEBUG_METRICS", "0") == "1"
 
 app = FastAPI(title="Imagine Video Worker", docs_url=None, redoc_url=None)
@@ -76,8 +77,8 @@ def _cleanup(job: dict[str, Any]) -> None:
 
 def _frame_counts(duration_seconds: int) -> tuple[int, int]:
     """Wan alignment is 4n+1; encode only the first exact-duration frames."""
-    if duration_seconds not in (10, 15):
-        raise ValueError("duration must be 10 or 15 seconds")
+    if duration_seconds not in SUPPORTED_DURATIONS:
+        raise ValueError("duration must be between 3 and 30 seconds")
     output_frames = duration_seconds * FPS
     model_frames = output_frames + 1
     if (model_frames - 1) % 4:
@@ -167,7 +168,7 @@ async def _finalize(raw_path, result_path, output_frames):
 
     probe = await asyncio.create_subprocess_exec(
         "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-        "stream=nb_frames,avg_frame_rate", "-of", "json", str(result_path),
+        "stream=nb_frames,avg_frame_rate:format=duration", "-of", "json", str(result_path),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
     try:
@@ -179,9 +180,12 @@ async def _finalize(raw_path, result_path, output_frames):
             except ProcessLookupError:
                 pass
             await probe.wait()
-    streams = json.loads(stdout)["streams"] if probe.returncode == 0 else []
+    metadata = json.loads(stdout) if probe.returncode == 0 else {}
+    streams = metadata.get("streams", [])
+    duration = float(metadata.get("format", {}).get("duration", "nan"))
     if (len(streams) != 1 or streams[0].get("nb_frames") != str(output_frames)
-            or streams[0].get("avg_frame_rate") != f"{FPS}/1"):
+            or streams[0].get("avg_frame_rate") != f"{FPS}/1"
+            or abs(duration - output_frames / FPS) > 0.001):
         raise RuntimeError("LightX2V output did not match the requested native frame count and FPS")
 
 
@@ -316,8 +320,12 @@ async def health(authorization: str | None = Header(None)):
         "attention": {"self": "dynamic_sparse_attn (sage2, 90% sparsity)", "cross": "sage_attn2"},
         "resolution": "approximately 720p, aspect-preserving",
         "fps": FPS,
-        "supported_durations_seconds": [10, 15] if LONG_VIDEO_ENABLED else [],
+        "supported_durations_seconds": SUPPORTED_DURATIONS if LONG_VIDEO_ENABLED else [],
+        "experimental_durations_seconds": SUPPORTED_DURATIONS if LONG_VIDEO_ENABLED else [],
         "experimental_long_video": LONG_VIDEO_ENABLED,
+        "duration_capability_scope": "API acceptance only; 3–30 second quality, memory use, and latency are not validated on the target GPU",
+        "frame_policy": {"alignment": "4n+1", "generated": "16*seconds+1", "exported": "16*seconds", "trim": "one final generated frame"},
+        "official_preset": {"model_frames": 81, "resolution": [480, 832], "fps": 16, "steps": 4},
         "gpu": runtime.device_name,
     }
 
@@ -330,9 +338,9 @@ async def create_job(
 ):
     _authorized(authorization)
     if not LONG_VIDEO_ENABLED:
-        raise HTTPException(422, "LightWan 10/15-second output is experimental; enable IMAGINE_LIGHTWAN_ENABLE_LONG_VIDEO=1")
-    if duration_seconds not in (10, 15):
-        raise HTTPException(422, "duration_seconds must be 10 or 15")
+        raise HTTPException(422, "LightWan 3–30-second output is experimental; enable IMAGINE_LIGHTWAN_ENABLE_LONG_VIDEO=1")
+    if duration_seconds not in SUPPORTED_DURATIONS:
+        raise HTTPException(422, "duration_seconds must be between 3 and 30")
     if mode != "turbo":
         raise HTTPException(422, "LightWan uses the turbo wire compatibility mode")
     if steps not in (None, 8):
