@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import os
 import shutil
 import time
@@ -142,7 +143,7 @@ async def _finalize(raw_path, result_path, output_frames):
         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
         "-protocol_whitelist", "file,pipe", "-i", str(raw_path),
         "-map", "0:v:0", "-an", "-map_metadata", "-1", "-frames:v", str(output_frames),
-        "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-fps_mode", "passthrough", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart", str(result_path),
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
@@ -156,6 +157,26 @@ async def _finalize(raw_path, result_path, output_frames):
             except ProcessLookupError:
                 pass
             await process.wait()
+
+
+    probe = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+        "stream=nb_frames,avg_frame_rate", "-of", "json", str(result_path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        stdout, _ = await probe.communicate()
+    finally:
+        if probe.returncode is None:
+            try:
+                probe.kill()
+            except ProcessLookupError:
+                pass
+            await probe.wait()
+    streams = json.loads(stdout)["streams"] if probe.returncode == 0 else []
+    if (len(streams) != 1 or streams[0].get("nb_frames") != str(output_frames)
+            or streams[0].get("avg_frame_rate") != f"{FPS}/1"):
+        raise RuntimeError("LightX2V output did not match the requested native frame count and FPS")
 
 
 async def _run_job(job_id: str) -> None:
@@ -231,7 +252,9 @@ async def _reaper() -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    if not DATA_ROOT.resolve().is_relative_to(Path("/tmp").resolve()):
+    local_tmp = Path("/tmp").resolve()
+    resolved = DATA_ROOT.resolve()
+    if resolved == local_tmp or not resolved.is_relative_to(local_tmp):
         raise RuntimeError("Job storage must stay under /tmp")
     DATA_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     DATA_ROOT.chmod(0o700)

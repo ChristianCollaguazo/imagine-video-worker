@@ -59,11 +59,14 @@ def download_verified(item: dict, destination: Path) -> None:
 
 
 def main() -> None:
-    if not MOUNT.is_absolute() or MOUNT == Path("/"):
+    if not MOUNT.is_absolute() or MOUNT.resolve() == Path("/"):
         raise SystemExit("Invalid IMAGINE_GLOBAL_MOUNT")
     if subprocess.run(["mountpoint", "-q", str(MOUNT)]).returncode:
         raise SystemExit(f"No volume mounted at {MOUNT}; check RunPod mount path")
 
+    local, mounted = LOCAL.resolve(), MOUNT.resolve()
+    if local.is_relative_to(mounted) or mounted.is_relative_to(local):
+        raise SystemExit("Model staging must use a separate local directory")
     manifest = json.loads((ROOT / "config/model-manifest.json").read_text())
     if manifest.get("model_root") != MODEL_ROOT_NAME or len(manifest.get("models", [])) != 9:
         raise SystemExit("Unexpected LightWan manifest; refusing to stage other model families")
