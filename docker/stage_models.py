@@ -12,6 +12,7 @@ LOCAL = ROOT / "ComfyUI" / "models"
 MOUNT = Path(os.environ.get("IMAGINE_GLOBAL_MOUNT", "/workspace-global"))
 REMOTE = MOUNT / "imagine-h3-turbo" / "models"
 DOWNLOAD = os.environ.get("IMAGINE_DOWNLOAD_MODELS", "0") == "1"
+STORAGE_MODE = os.environ.get("IMAGINE_MODEL_STORAGE_MODE", "local").strip().lower()
 
 
 def valid(path, expected):
@@ -22,10 +23,11 @@ def valid(path, expected):
 
 
 def main():
-    if not MOUNT.is_absolute() or MOUNT == Path("/"):
-        raise SystemExit("Invalid IMAGINE_GLOBAL_MOUNT")
-    if subprocess.run(["mountpoint", "-q", str(MOUNT)]).returncode:
-        raise SystemExit(f"No volume mounted at {MOUNT}; check RunPod mount path")
+    if STORAGE_MODE not in {"local", "download"}:
+        raise SystemExit("IMAGINE_MODEL_STORAGE_MODE must be local or download")
+    if STORAGE_MODE == "download" and not DOWNLOAD:
+        raise SystemExit("IMAGINE_MODEL_STORAGE_MODE=download requires IMAGINE_DOWNLOAD_MODELS=1")
+
     manifest = json.loads((ROOT / "config/model-manifest.json").read_text())
     shared = manifest["models"]
     turbo = [x for x in manifest.get("optional_models", []) if x["id"] == "fl2v_turbo_lora_8step"]
@@ -34,6 +36,26 @@ def main():
     models = shared + turbo
     if any(not x.get("sha256") or not x.get("repo") or not x.get("revision") for x in models):
         raise SystemExit("Manifest must pin repo, revision and SHA-256 for each model")
+
+    if STORAGE_MODE == "download":
+        if __package__:
+            from .model_downloader import download_pinned_models
+        else:
+            from model_downloader import download_pinned_models
+        try:
+            result = download_pinned_models(models, LOCAL)
+        except (RuntimeError, OSError) as exc:
+            raise SystemExit(f"Turbo model download failed: {exc}") from None
+        result.update({"storage_mode": "download", "verification_mode": "full"})
+        if os.environ.get("IMAGINE_DEBUG_METRICS", "0") == "1":
+            print("imagine_metric " + json.dumps({"event": "model_staging_finished", **result}, sort_keys=True), flush=True)
+        print("All Turbo weights downloaded and SHA-256 verified locally", flush=True)
+        return
+
+    if not MOUNT.is_absolute() or MOUNT == Path("/"):
+        raise SystemExit("Invalid IMAGINE_GLOBAL_MOUNT")
+    if subprocess.run(["mountpoint", "-q", str(MOUNT)]).returncode:
+        raise SystemExit(f"No volume mounted at {MOUNT}; check RunPod mount path")
     LOCAL.mkdir(parents=True, exist_ok=True)
     pending = sum(x["bytes_approx"] for x in models if not (LOCAL / x["path"]).is_file())
     if shutil.disk_usage(LOCAL).free < pending + 10 * 1024**3:

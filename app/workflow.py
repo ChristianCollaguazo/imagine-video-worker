@@ -13,6 +13,8 @@ CLIP = _models["text_encoder"]
 VIDEO_VAE = _models["video_vae"]
 AUDIO_VAE = _models["audio_vae"]
 TURBO_LORA = _optional_models["fl2v_turbo_lora_8step"]
+VIDEO_FPS = 24
+SUPPORTED_DURATIONS = tuple(range(3, 31))
 DEFAULT_STEPS = 12
 ALLOWED_STEPS = (8, 12, 20)
 
@@ -44,12 +46,11 @@ def canvas_for_image(width: int, height: int) -> tuple[int, int]:
 
 
 def model_frame_count(duration_seconds: int) -> int:
-    """Return nearest legal H3 17k+5 frame length (24 fps); final clip is trimmed."""
-    if duration_seconds not in (10, 15):
-        raise ValueError("duration_seconds must be 10 or 15")
-    target = duration_seconds * 24
-    k = round((target - 5) / 17)
-    return 17 * k + 5  # 243 or 362 frames, the legal H3 grid
+    """Round up to the H3 17k+5 grid so the export can trim surplus frames."""
+    if duration_seconds not in SUPPORTED_DURATIONS:
+        raise ValueError("duration_seconds must be between 3 and 30")
+    target = duration_seconds * VIDEO_FPS
+    return 17 * ((target - 5 + 16) // 17) + 5
 
 
 def build_workflow(
@@ -61,6 +62,8 @@ def build_workflow(
     image_height: int = 9,
     job_id: str | None = None,
     steps: int | None = None,
+    *,
+    audio: bool = True,
 ) -> dict:
     """Build the ComfyUI API prompt graph for one image plus one prompt."""
     if not prompt.strip():
@@ -91,13 +94,18 @@ def build_workflow(
         }},
         "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
         "13": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["11", 0], "vae": ["4", 0]}},
-        "14": {"class_type": "CreateVideo", "inputs": {"images": ["12", 0], "audio": ["13", 0], "fps": 24}},
+        "14": {"class_type": "CreateVideo", "inputs": {"images": ["12", 0], "audio": ["13", 0], "fps": VIDEO_FPS}},
         "15": {"class_type": "SaveVideo", "inputs": {
             "video": ["14", 0], "filename_prefix": f"imagine_h3/{job_id or 'job'}/video",
             "format": "mp4", "format.codec": "h264",
             "format.codec.encoding": "re-encode", "format.codec.encoding.crf": 18,
         }},
     }
+    if not audio:
+        # FL2VA still generates joint latents. Only skip decoding and muxing the audio.
+        del graph["4"]
+        del graph["13"]
+        del graph["14"]["inputs"]["audio"]
     return graph
 
 
@@ -109,11 +117,13 @@ def build_turbo_workflow(
     image_width: int = 16,
     image_height: int = 9,
     job_id: str | None = None,
+    *,
+    audio: bool = True,
 ) -> dict:
     """Build the separate official 8-step LoRA I2V experiment graph."""
     graph = build_workflow(
         prompt, image_filename, duration_seconds, seed,
-        image_width, image_height, job_id, steps=8,
+        image_width, image_height, job_id, steps=8, audio=audio,
     )
     graph["16"] = {
         "class_type": "LoraLoaderModelOnly",

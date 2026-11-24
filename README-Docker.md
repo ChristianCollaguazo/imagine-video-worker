@@ -4,6 +4,26 @@ Add these files to the root of the existing imagine-video-worker checkout. The
 image uses the repository's manifest, app and start/stop scripts, not a new API.
 Requires the quantized INT8/NVFP4 manifest with the 8-step Turbo LoRA.
 
+## RunPod sin Global Volume
+
+Usa `christiancollaguazo/imagine-video-worker:turbo-v1-download`, Container Disk de 100 GB,
+puerto HTTP 8000 y conserva el secreto del worker. Para esta modalidad, deja
+Global Volume sin adjuntar y configura:
+
+```dotenv
+IMAGINE_VIDEO_TOKEN={{ RUNPOD_SECRET_imagine_video_token }}
+IMAGINE_MODEL_STORAGE_MODE=download
+IMAGINE_DOWNLOAD_MODELS=1
+IMAGINE_DEBUG_METRICS=1
+```
+
+El arranque descarga los cinco archivos fijados (42.03 GB), comprueba tamaño y
+SHA-256 y solo entonces inicia ComfyUI. Los archivos válidos se reutilizan al
+reiniciar el mismo contenedor. Un Pod nuevo descarga de nuevo. El evento
+`model_staging_finished` registra `download_seconds`, `verification_seconds`
+y `bytes_downloaded`. La API admite duraciones enteras de 3 a 30 segundos.
+El rendimiento y la calidad de las duraciones extremas requieren pruebas en GPU.
+
 ## Mac: build and publish once
 
 Install and start Docker Desktop. Unzip this archive into the repository root.
@@ -16,7 +36,7 @@ cd ~/Documents/projects/Imagine/imagine-video-worker
 unzip -o ~/Downloads/imagine-runpod-docker.zip -d .
 docker login
 docker buildx build --platform linux/amd64 \
-  -t TU_USUARIO_DOCKERHUB/imagine-video-worker:turbo-v1 --push .
+  -t TU_USUARIO_DOCKERHUB/imagine-video-worker:turbo-v1-download --push .
 ```
 
 Docker Desktop on Apple Silicon builds amd64 via emulation. No NVIDIA GPU is

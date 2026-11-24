@@ -12,7 +12,8 @@
       "repo": "Comfy-Org/MiniMax-H3",
       "revision": "3f57e8291d2ef846f9a074b1b76d2767db434abe",
       "sha256": "e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a",
-      "bytes_approx": 21000000000
+      "bytes": 20970379616,
+      "bytes_approx": 20970379616
     },
     {
       "id": "text_encoder",
@@ -22,6 +23,7 @@
       "repo": "Comfy-Org/MiniMax-H3",
       "revision": "3f57e8291d2ef846f9a074b1b76d2767db434abe",
       "sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6",
+      "bytes": 15687142551,
       "bytes_approx": 15687142551
     },
     {
@@ -32,7 +34,8 @@
       "repo": "Comfy-Org/MiniMax-H3",
       "revision": "7cc7389563624200249315b8fc37d3d6c943d846",
       "sha256": "52a2c8c73583c86e4f41cdcce3a6ad0ea562987bc0bf3d60a0cef5f5c8e60c0e",
-      "bytes_approx": 2810000000
+      "bytes": 2811065184,
+      "bytes_approx": 2811065184
     },
     {
       "id": "audio_vae",
@@ -42,7 +45,8 @@
       "repo": "Comfy-Org/MiniMax-H3",
       "revision": "3f57e8291d2ef846f9a074b1b76d2767db434abe",
       "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
-      "bytes_approx": 605000000
+      "bytes": 605254808,
+      "bytes_approx": 605254808
     }
   ],
   "optional_models": [
@@ -54,7 +58,8 @@
       "repo": "Comfy-Org/MiniMax-H3",
       "revision": "186455f4c2a878eb57d5c7916c5b0f71a77e8ceb",
       "sha256": "2339acdf19bfe123f46b971ea35d367a84adb85de43627e1eceafa5a5b2b111e",
-      "bytes_approx": 1960000000
+      "bytes": 1956193000,
+      "bytes_approx": 1956193000
     }
   ],
   "comfyui": {
