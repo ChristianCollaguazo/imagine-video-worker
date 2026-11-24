@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import shutil
 import time
@@ -17,7 +18,17 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .comfy import ComfyClient, ModelLoaderError, new_client_id
-from .workflow import SUPPORTED_DURATIONS, VIDEO_FPS, TURBO_LORA, build_turbo_workflow, build_workflow, sampling_steps
+from .lora_catalog import available_lora_names, resolve_lora_name
+from .workflow import (
+    DEFAULT_RESOLUTION,
+    SUPPORTED_DURATIONS,
+    SUPPORTED_RESOLUTIONS,
+    VIDEO_FPS,
+    TURBO_LORA,
+    build_workflow,
+    canvas_for_image,
+    sampling_steps,
+)
 
 TOKEN = os.environ.get("IMAGINE_VIDEO_TOKEN", "")
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
@@ -104,7 +115,15 @@ async def token_gate(request, call_next):
 
 
 def _snapshot(job: dict[str, Any]) -> dict[str, Any]:
-    return {key: job.get(key) for key in ("id", "status", "stage", "progress", "error", "steps", "mode")}
+    return {key: job.get(key) for key in ("id", "status", "stage", "progress", "error", "steps", "mode", "resolution", "effective_width", "effective_height", "lora_name", "lora_strength")}
+
+
+def _available_lora_names() -> list[str]:
+    return available_lora_names(COMFY_ROOT / "models" / "loras")
+
+
+def _resolve_lora_name(mode: str, requested: str | None, available: list[str]) -> str | None:
+    return resolve_lora_name(mode, requested, available, TURBO_LORA)
 
 
 def _authorized(authorization: str | None):
@@ -214,6 +233,9 @@ async def _run_job(job_id: str):
         _metric(
             "generation_started", generation=generation_number, warm=generation_number > 1,
             generation_state="initial" if generation_number == 1 else "subsequent",
+            mode=job["mode"], steps=job["steps"], resolution=job["resolution"],
+            effective_width=job["effective_width"], effective_height=job["effective_height"],
+            lora_name=job.get("lora_name"), lora_strength=job["lora_strength"],
         )
         job["status"], job["stage"], job["progress"] = "running", "uploading_photo", None
         try:
@@ -230,13 +252,14 @@ async def _run_job(job_id: str):
                 return
             job["stage"], job["progress"] = "generating_video", None
             phase_started = time.perf_counter()
-            if job["mode"] == "turbo":
-                lora_file = COMFY_ROOT / "models" / "loras" / TURBO_LORA
-                if not lora_file.is_file():
-                    raise RuntimeError("Turbo mode requested but its 8-step LoRA is not installed")
-                workflow = build_turbo_workflow(job["prompt"], comfy_name, job["duration_seconds"], job["seed"], job["image_width"], job["image_height"], job["id"], audio=AUDIO)
-            else:
-                workflow = build_workflow(job["prompt"], comfy_name, job["duration_seconds"], job["seed"], job["image_width"], job["image_height"], job["id"], steps=job["steps"], audio=AUDIO)
+            if job.get("lora_name") and not (COMFY_ROOT / "models" / "loras" / job["lora_name"]).is_file():
+                raise RuntimeError("Selected LoRA is no longer available")
+            workflow = build_workflow(
+                job["prompt"], comfy_name, job["duration_seconds"], job["seed"],
+                job["image_width"], job["image_height"], job["id"],
+                steps=job["steps"], audio=AUDIO, resolution=job["resolution"],
+                lora_name=job.get("lora_name"), lora_strength=job["lora_strength"],
+            )
             job.pop("prompt", None)
             client_id = new_client_id()
             prompt_id = await comfy.queue(workflow, client_id)
@@ -533,35 +556,85 @@ async def health(authorization: str | None = Header(None)):
         available_nodes = await comfy.health()
     except Exception:
         raise HTTPException(503, "Worker is not ready") from None
-    turbo_file = COMFY_ROOT / "models" / "loras" / TURBO_LORA
-    turbo_available = turbo_file.is_file() and "LoraLoaderModelOnly" in available_nodes
-    return {"status": "ok", "model": "MiniMax H3 FL2VA INT8 ConvRot", "attention_policy": "PyTorch automatic dispatch via ComfyUI; selected kernel may vary by operation", "capabilities": {"image_to_video": True, "audio_output": AUDIO, "audio_latents_generated": True, "turbo_lora_8step": turbo_available, "durations_seconds": SUPPORTED_DURATIONS}, "supported_durations_seconds": SUPPORTED_DURATIONS, "supported_steps": [8, 12, 20], "supported_modes": ["base", "turbo"] if turbo_available else ["base"]}
+    lora_names = _available_lora_names() if "LoraLoaderModelOnly" in available_nodes else []
+    turbo_available = TURBO_LORA in lora_names
+    any_lora_available = bool(lora_names)
+    return {
+        "status": "ok",
+        "model": "MiniMax H3 FL2VA INT8 ConvRot",
+        "attention_policy": "PyTorch automatic dispatch via ComfyUI; selected kernel may vary by operation",
+        "capabilities": {
+            "image_to_video": True,
+            "audio_output": AUDIO,
+            "audio_latents_generated": True,
+            "loras": bool(lora_names),
+            "default_lora": TURBO_LORA if turbo_available else None,
+            "durations_seconds": SUPPORTED_DURATIONS,
+        },
+        "supported_durations_seconds": SUPPORTED_DURATIONS,
+        "supported_steps": list(range(1, 51)),
+        "supported_resolutions": list(SUPPORTED_RESOLUTIONS),
+        "default_parameters": {"mode": "turbo", "steps": 8, "resolution": DEFAULT_RESOLUTION, "lora_name": TURBO_LORA if turbo_available else None, "lora_strength": 1.0},
+        "supported_modes": ["base", "turbo"] if any_lora_available else ["base"],
+    }
+
+
+@app.get("/v1/loras")
+async def list_loras(authorization: str | None = Header(None)):
+    _authorized(authorization)
+    try:
+        available_nodes = await comfy.health()
+    except Exception:
+        raise HTTPException(503, "ComfyUI is not ready") from None
+    names = _available_lora_names() if "LoraLoaderModelOnly" in available_nodes else []
+    return {
+        "loras": [{"name": name, "available": True, "default_strength": 1.0} for name in names],
+        "default_lora": TURBO_LORA if TURBO_LORA in names else None,
+    }
 
 
 @app.post("/v1/jobs")
-async def create_job(file: UploadFile = File(...), prompt: str = Form(...), duration_seconds: int = Form(...), steps: int | None = Form(None), mode: str = Form("base"), authorization: str | None = Header(None), idempotency_key: str | None = Header(None, alias="Idempotency-Key")):
+async def create_job(
+    file: UploadFile = File(...),
+    prompt: str = Form(...),
+    duration_seconds: int = Form(...),
+    steps: int | None = Form(None),
+    mode: str = Form("turbo"),
+    resolution: int = Form(DEFAULT_RESOLUTION),
+    lora_name: str | None = Form(None),
+    lora_strength: float = Form(1.0),
+    authorization: str | None = Header(None),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
     _authorized(authorization)
     if duration_seconds not in SUPPORTED_DURATIONS:
         raise HTTPException(422, "duration_seconds must be between 3 and 30")
     if mode not in {"base", "turbo"}:
         raise HTTPException(422, "mode must be base or turbo")
-    if mode == "turbo":
-        if steps not in (None, 8):
-            raise HTTPException(422, "Turbo mode requires 8 steps")
-        if not (COMFY_ROOT / "models" / "loras" / TURBO_LORA).is_file():
-            raise HTTPException(503, "Turbo mode is unavailable because its 8-step LoRA is not installed")
+    if resolution not in SUPPORTED_RESOLUTIONS:
+        raise HTTPException(422, "resolution must be 480, 576, or 768")
+    if not math.isfinite(lora_strength) or not 0.0 <= lora_strength <= 2.0:
+        raise HTTPException(422, "lora_strength must be between 0 and 2")
+    available_loras = _available_lora_names()
+    if mode == "turbo" and not lora_name and TURBO_LORA not in available_loras:
+        raise HTTPException(503, "Turbo mode is unavailable because its default LoRA is not installed")
+    try:
+        selected_lora = _resolve_lora_name(mode, lora_name, available_loras)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    if mode == "turbo" and not selected_lora:
+        raise HTTPException(503, "Turbo mode is unavailable because no LoRA is installed")
+    if selected_lora:
         try:
             available_nodes = await comfy.health()
         except Exception:
             raise HTTPException(503, "ComfyUI is not ready") from None
         if "LoraLoaderModelOnly" not in available_nodes:
-            raise HTTPException(503, "Turbo mode is unavailable because ComfyUI lacks LoraLoaderModelOnly")
-        selected_steps = 8
-    else:
-        try:
-            selected_steps = sampling_steps(steps)
-        except ValueError as exc:
-            raise HTTPException(422, "steps must be 8, 12, or 20") from exc
+            raise HTTPException(503, "ComfyUI cannot load LoRAs")
+    try:
+        selected_steps = 8 if steps is None and mode == "turbo" else sampling_steps(steps, default=12)
+    except ValueError as exc:
+        raise HTTPException(422, "steps must be an integer from 1 to 50") from exc
     prompt = prompt.strip()
     if not prompt or len(prompt) > 2000:
         raise HTTPException(422, "Prompt must contain 1 to 2000 characters")
@@ -593,7 +666,8 @@ async def create_job(file: UploadFile = File(...), prompt: str = Form(...), dura
         renamed = folder / ("input" + suffix)
         input_path.rename(renamed)
         input_path = renamed
-    job = {"id": job_id, "status": "queued", "stage": "queued", "progress": 0, "error": None, "prompt": prompt, "duration_seconds": duration_seconds, "steps": selected_steps, "mode": mode, "folder": folder, "input_path": input_path, "created_at": time.time(), "input_sha256": digest, "seed": int.from_bytes(os.urandom(8), "big"), "image_width": image_width, "image_height": image_height, "cancel_event": asyncio.Event()}
+    effective_width, effective_height = canvas_for_image(image_width, image_height, resolution)
+    job = {"id": job_id, "status": "queued", "stage": "queued", "progress": 0, "error": None, "prompt": prompt, "duration_seconds": duration_seconds, "steps": selected_steps, "mode": mode, "resolution": resolution, "effective_width": effective_width, "effective_height": effective_height, "lora_name": selected_lora, "lora_strength": float(lora_strength), "folder": folder, "input_path": input_path, "created_at": time.time(), "input_sha256": digest, "seed": int.from_bytes(os.urandom(8), "big"), "image_width": image_width, "image_height": image_height, "cancel_event": asyncio.Event()}
     jobs[job_id] = job
     if idempotency_key:
         idempotency[idempotency_key] = job_id
