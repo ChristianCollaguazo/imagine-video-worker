@@ -61,6 +61,8 @@ def build_workflow(
     image_height: int = 9,
     job_id: str | None = None,
     steps: int | None = None,
+    *,
+    audio: bool = True,
 ) -> dict:
     """Build the ComfyUI API prompt graph for one image plus one prompt."""
     if not prompt.strip():
@@ -98,6 +100,11 @@ def build_workflow(
             "format.codec.encoding": "re-encode", "format.codec.encoding.crf": 18,
         }},
     }
+    if not audio:
+        # FL2VA still generates joint latents. Only skip decoding and muxing the audio.
+        del graph["4"]
+        del graph["13"]
+        del graph["14"]["inputs"]["audio"]
     return graph
 
 
@@ -109,11 +116,13 @@ def build_turbo_workflow(
     image_width: int = 16,
     image_height: int = 9,
     job_id: str | None = None,
+    *,
+    audio: bool = True,
 ) -> dict:
     """Build the separate official 8-step LoRA I2V experiment graph."""
     graph = build_workflow(
         prompt, image_filename, duration_seconds, seed,
-        image_width, image_height, job_id, steps=8,
+        image_width, image_height, job_id, steps=8, audio=audio,
     )
     graph["16"] = {
         "class_type": "LoraLoaderModelOnly",

@@ -75,12 +75,15 @@ class ComfyClient:
                         report(data)
                     elif message.get("type") == "executing" and data.get("node") is not None:
                         node = str(data.get("node"))
+                        report({"node_started": node})
                         stage = "decoding_video" if node in {"12", "13"} else "exporting_video" if node in {"14", "15"} else None
                         if stage:
                             report({"node": node, "stage": stage})
                     elif message.get("type") == "execution_error":
-                        raise RuntimeError(data.get("exception_message", "ComfyUI execution failed"))
+                        report({"node_started": None})
+                        raise RuntimeError("ComfyUI execution failed")
                     elif message.get("type") == "executing" and data.get("node") is None:
+                        report({"node_started": None})
                         # Comfy can emit the terminal event just before history is committed.
                         for _ in range(30):
                             if cancelled():
@@ -129,7 +132,8 @@ class ComfyClient:
         return False
 
     async def forget_prompt(self, prompt_id: str):
-        await self.http.post("/history", json={"delete": [prompt_id]})
+        response = await self.http.post("/history", json={"delete": [prompt_id]})
+        response.raise_for_status()
 
 
 def new_client_id() -> str:

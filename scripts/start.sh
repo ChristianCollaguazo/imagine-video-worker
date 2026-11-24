@@ -9,6 +9,19 @@ export COMFY_INPUT_DIR="$RUN_ROOT/comfy/input"
 export COMFY_OUTPUT_DIR="$RUN_ROOT/comfy/output"
 export COMFY_TEMP_DIR="$RUN_ROOT/comfy/temp"
 export IMAGINE_VIDEO_DATA="$RUN_ROOT/jobs"
+comfy_args=()
+case "${IMAGINE_H3_VRAM_PROFILE:-auto}" in
+  auto) ;;
+  high)
+    "${ROOT}/.venv-comfy/bin/python" -c 'import torch; assert torch.cuda.get_device_properties(0).total_memory >= 90 * 1024**3, "High VRAM profile requires at least 90 GiB VRAM"'
+    comfy_args+=(--highvram --reserve-vram 12)
+    ;;
+  *) echo "IMAGINE_H3_VRAM_PROFILE must be auto or high" >&2; exit 1 ;;
+esac
+case "${IMAGINE_H3_AUDIO:-1}" in
+  0|1) ;;
+  *) echo "IMAGINE_H3_AUDIO must be 0 or 1" >&2; exit 1 ;;
+esac
 
 : "${IMAGINE_VIDEO_TOKEN:?Set IMAGINE_VIDEO_TOKEN in the process environment}"
 command -v ffmpeg >/dev/null || { echo "ffmpeg is required" >&2; exit 1; }
@@ -67,7 +80,7 @@ trap cleanup_on_error EXIT
 cd "$ROOT"
 # Prompts and images are transient; do not write ComfyUI/worker logs or prompt metadata to disk.
 "$ROOT/.venv-comfy/bin/python" "$COMFY_ROOT/main.py" \
-  --base-directory "$COMFY_ROOT" \
+  --base-directory "$COMFY_ROOT" "${comfy_args[@]}" \
   --input-directory "$COMFY_INPUT_DIR" \
   --output-directory "$COMFY_OUTPUT_DIR" \
   --temp-directory "$RUN_ROOT/comfy" \
@@ -86,7 +99,7 @@ if [[ "$healthy" -ne 1 ]]; then echo "ComfyUI did not become healthy" >&2; exit 
 
 # Provider ingress must terminate TLS and expose only this service on HTTPS port 8000.
 PYTHONPATH="$ROOT" "$ROOT/.venv-comfy/bin/uvicorn" app.main:app \
-  --host 0.0.0.0 --port 8000 >/dev/null 2>&1 &
+  --host 0.0.0.0 --port 8000 --no-access-log 2>/dev/null &
 worker_pid=$!
 echo "$worker_pid" > "$RUN_ROOT/pids/worker.pid"
 

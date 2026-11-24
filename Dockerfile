@@ -16,6 +16,10 @@ RUN python3 -m venv .venv-comfy && \
     python3 -c 'import json,subprocess; m=json.load(open("config/model-manifest.json")); r=m["runtime"]; subprocess.check_call(["git","clone","--depth","1","--branch",m["comfyui"]["ref"],m["comfyui"]["repository"],"ComfyUI"]); subprocess.check_call([".venv-comfy/bin/python","-m","pip","install",*[f"{k}=={r[k]}" for k in ("torch","torchvision","torchaudio")],"--index-url",r["torch_index_url"]])' && \
     .venv-comfy/bin/python -m pip install -r ComfyUI/requirements.txt -r requirements.txt huggingface_hub && \
     .venv-comfy/bin/python -m pip check
+ARG IMAGINE_SOURCE_COMMIT=unknown
+LABEL org.opencontainers.image.revision=$IMAGINE_SOURCE_COMMIT \
+      org.opencontainers.image.source=https://github.com/ChristianCollaguazo/imagine-video-worker
+ENV IMAGINE_DEBUG_METRICS=0 IMAGINE_H3_VRAM_PROFILE=auto IMAGINE_H3_AUDIO=1
 COPY app/ ./app/
 COPY scripts/ ./scripts/
 COPY docker/ ./docker/
