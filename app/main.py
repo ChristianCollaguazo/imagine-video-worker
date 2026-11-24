@@ -301,19 +301,25 @@ async def _run_job(job_id: str):
             phase_started = time.perf_counter()
             communicate = asyncio.create_task(process.communicate())
             cancelled = asyncio.create_task(job["cancel_event"].wait())
-            done, _ = await asyncio.wait({communicate, cancelled}, return_when=asyncio.FIRST_COMPLETED)
-            if cancelled in done and job["cancel_event"].is_set():
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
-                await communicate
-                return
-            cancelled.cancel()
-            await asyncio.gather(cancelled, return_exceptions=True)
-            _, _ = communicate.result()
+            try:
+                done, _ = await asyncio.wait({communicate, cancelled}, return_when=asyncio.FIRST_COMPLETED)
+                if cancelled in done:
+                    return
+                communicate.result()
+            finally:
+                cancelled.cancel()
+                await asyncio.gather(cancelled, return_exceptions=True)
+                if process.returncode is None:
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(asyncio.shield(communicate), timeout=5)
+                    except asyncio.TimeoutError:
+                        if process.returncode is None:
+                            process.kill()
+                        await communicate
             if process.returncode:
                 raise RuntimeError("Video finalization failed")
             _metric("phase", name="mp4_finalize", seconds=round(time.perf_counter() - phase_started, 3))

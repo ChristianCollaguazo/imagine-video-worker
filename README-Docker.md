@@ -75,7 +75,8 @@ aproximación de reloj de pared a partir de los eventos de ComfyUI.
   produce MP4 sin pista de audio. FL2VA sigue difundiendo latentes de audio
   junto con los de video. La opción ahorra el trabajo posterior a difusión.
 - El backend predeterminado usa SDPA de PyTorch con despacho automático por
-  operación. La instrumentación registra esa política. Para identificar cada
+  operación. `comfy_attention_selected` registra el backend elegido por
+  ComfyUI al arrancar. Para identificar cada
   kernel en ejecución hacen falta trazas del perfilador CUDA. Se conserva la
   ruta de cuantización y operadores Comfy Kitchen del runtime original.
 

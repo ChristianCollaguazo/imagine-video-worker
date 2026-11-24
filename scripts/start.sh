@@ -78,15 +78,36 @@ trap cleanup_on_error EXIT
 "$ROOT/.venv-comfy/bin/python" "$ROOT/scripts/check_models.py"
 
 cd "$ROOT"
-# Prompts and images are transient; do not write ComfyUI/worker logs or prompt metadata to disk.
-"$ROOT/.venv-comfy/bin/python" "$COMFY_ROOT/main.py" \
-  --base-directory "$COMFY_ROOT" "${comfy_args[@]}" \
-  --input-directory "$COMFY_INPUT_DIR" \
-  --output-directory "$COMFY_OUTPUT_DIR" \
-  --temp-directory "$RUN_ROOT/comfy" \
-  --database-url sqlite:///:memory: \
-  --listen 127.0.0.1 --port 8188 --disable-auto-launch --disable-metadata \
-  >/dev/null 2>&1 &
+# Only allow fixed, upstream technical events on stdout. Comfy errors and
+# payload-derived strings stay out of container logs.
+log_comfy() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      'Using pytorch attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"pytorch_sdpa"}' ;;
+      'Using sage attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"sage"}' ;;
+      'Using Flash Attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"flash"}' ;;
+      'Using xformers attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"xformers"}' ;;
+      'Using Comfy Kitchen attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"comfy_kitchen"}' ;;
+      'Using split optimization for attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"split"}' ;;
+      'Using sub quadratic optimization for attention, if you have memory or speed issues try using: --use-split-cross-attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"sub_quad"}' ;;
+    esac
+  done
+}
+run_comfy() {
+  exec "$ROOT/.venv-comfy/bin/python" "$COMFY_ROOT/main.py" \
+    --base-directory "$COMFY_ROOT" "${comfy_args[@]}" \
+    --input-directory "$COMFY_INPUT_DIR" \
+    --output-directory "$COMFY_OUTPUT_DIR" \
+    --temp-directory "$RUN_ROOT/comfy" \
+    --database-url sqlite:///:memory: \
+    --listen 127.0.0.1 --port 8188 --disable-auto-launch --disable-metadata
+}
+if [[ "${IMAGINE_DEBUG_METRICS:-0}" == "1" ]]; then
+  run_comfy > >(log_comfy) 2>&1 &
+else
+  run_comfy >/dev/null 2>&1 &
+fi
 comfy_pid=$!
 echo "$comfy_pid" > "$RUN_ROOT/pids/comfyui.pid"
 
