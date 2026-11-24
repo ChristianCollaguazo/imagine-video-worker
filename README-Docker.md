@@ -2,8 +2,14 @@
 
 Esta imagen usa MiniMax H3 FL2VA INT8 ConvRot, el encoder Qwen3VL NVFP4 y la
 LoRA Turbo de ocho pasos del MVP 1. El flujo predeterminado mantiene 24 FPS,
-el lienzo con lado corto de 768 px y el audio. ComfyUI genera 243 o 362
-cuadros y FFmpeg exporta 240 o 360 para entregar 10 o 15 segundos. El
+el lienzo con lado corto de 768 px y el audio. La API admite duraciones enteras
+de 3 a 30 segundos. ComfyUI redondea la longitud al siguiente valor válido de
+la cuadrícula H3 `17k+5`; FFmpeg recorta cuadros sobrantes y conserva 24 FPS,
+sin interpolación. El nodo de ComfyUI 0.34.0 acepta hasta 3600 cuadros, pero su
+descripción indica que el rango entrenado es aproximadamente 124–362 cuadros
+(5,2–15,1 s), y que duraciones mayores no están probadas. Los clips de 3–4 s
+y 16–30 s se aceptan técnicamente, pero su calidad y uso de VRAM siguen sin
+validarse en GPU. El
 Dockerfile se basa en el digest linux/amd64 de `turbo-v1` para conservar
 las versiones exactas del runtime que ya se usó en RunPod.
 

@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .comfy import ComfyClient, new_client_id
-from .workflow import TURBO_LORA, build_turbo_workflow, build_workflow, sampling_steps
+from .workflow import SUPPORTED_DURATIONS, VIDEO_FPS, TURBO_LORA, build_turbo_workflow, build_workflow, sampling_steps
 
 TOKEN = os.environ.get("IMAGINE_VIDEO_TOKEN", "")
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
@@ -295,8 +295,8 @@ async def _run_job(job_id: str):
             raw_path = job["folder"] / "comfy-output.mp4"
             result_path = job["folder"] / "result.mp4"
             raw_path.write_bytes(payload)
-            frame_count = 240 if job["duration_seconds"] == 10 else 360
-            command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-protocol_whitelist", "file,pipe", "-i", str(raw_path), "-map", "0:v:0", "-map", "0:a?", "-map_metadata", "-1", "-frames:v", str(frame_count), "-t", str(job["duration_seconds"]), "-vf", "fps=24", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-af", f"atrim=duration={job['duration_seconds']}", "-movflags", "+faststart", str(result_path)]
+            frame_count = job["duration_seconds"] * VIDEO_FPS
+            command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-protocol_whitelist", "file,pipe", "-i", str(raw_path), "-map", "0:v:0", "-map", "0:a?", "-map_metadata", "-1", "-frames:v", str(frame_count), "-t", str(job["duration_seconds"]), "-fps_mode", "passthrough", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-af", f"atrim=duration={job['duration_seconds']}", "-movflags", "+faststart", str(result_path)]
             process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
             phase_started = time.perf_counter()
             communicate = asyncio.create_task(process.communicate())
@@ -322,6 +322,21 @@ async def _run_job(job_id: str):
                         await communicate
             if process.returncode:
                 raise RuntimeError("Video finalization failed")
+            probe = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                "stream=nb_frames,avg_frame_rate", "-of", "json", str(result_path),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                output, _ = await asyncio.wait_for(probe.communicate(), timeout=10)
+            finally:
+                if probe.returncode is None:
+                    probe.kill()
+                    await probe.wait()
+            streams = json.loads(output)["streams"] if probe.returncode == 0 else []
+            if (len(streams) != 1 or streams[0].get("nb_frames") != str(frame_count)
+                    or streams[0].get("avg_frame_rate") != f"{VIDEO_FPS}/1"):
+                raise RuntimeError("Video did not match the requested native frame count and FPS")
             _metric("phase", name="mp4_finalize", seconds=round(time.perf_counter() - phase_started, 3))
             if job["cancel_event"].is_set():
                 return
@@ -506,14 +521,14 @@ async def health(authorization: str | None = Header(None)):
         raise HTTPException(503, "Worker is not ready") from None
     turbo_file = COMFY_ROOT / "models" / "loras" / TURBO_LORA
     turbo_available = turbo_file.is_file() and "LoraLoaderModelOnly" in available_nodes
-    return {"status": "ok", "model": "MiniMax H3 FL2VA INT8 ConvRot", "attention_policy": "PyTorch automatic dispatch via ComfyUI; selected kernel may vary by operation", "capabilities": {"image_to_video": True, "audio_output": AUDIO, "audio_latents_generated": True, "turbo_lora_8step": turbo_available, "durations_seconds": [10, 15]}, "supported_steps": [8, 12, 20], "supported_modes": ["base", "turbo"] if turbo_available else ["base"]}
+    return {"status": "ok", "model": "MiniMax H3 FL2VA INT8 ConvRot", "attention_policy": "PyTorch automatic dispatch via ComfyUI; selected kernel may vary by operation", "capabilities": {"image_to_video": True, "audio_output": AUDIO, "audio_latents_generated": True, "turbo_lora_8step": turbo_available, "durations_seconds": SUPPORTED_DURATIONS}, "supported_durations_seconds": SUPPORTED_DURATIONS, "supported_steps": [8, 12, 20], "supported_modes": ["base", "turbo"] if turbo_available else ["base"]}
 
 
 @app.post("/v1/jobs")
 async def create_job(file: UploadFile = File(...), prompt: str = Form(...), duration_seconds: int = Form(...), steps: int | None = Form(None), mode: str = Form("base"), authorization: str | None = Header(None), idempotency_key: str | None = Header(None, alias="Idempotency-Key")):
     _authorized(authorization)
-    if duration_seconds not in (10, 15):
-        raise HTTPException(422, "duration_seconds must be 10 or 15")
+    if duration_seconds not in SUPPORTED_DURATIONS:
+        raise HTTPException(422, "duration_seconds must be between 3 and 30")
     if mode not in {"base", "turbo"}:
         raise HTTPException(422, "mode must be base or turbo")
     if mode == "turbo":
