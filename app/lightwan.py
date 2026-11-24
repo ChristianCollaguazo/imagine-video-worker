@@ -53,7 +53,7 @@ class LightWanRuntime:
             raise RuntimeError("LightX2V process exited")
         return json.loads(raw)
 
-    async def generate(self, *, prompt, image_path, output_path, seed, height, width, model_frames):
+    async def generate(self, *, prompt, image_path, output_path, seed, height, width, model_frames, report=None):
         if not self.ready or self.process is None or self.process.stdin is None:
             raise RuntimeError("LightX2V is unavailable")
         request = {
@@ -64,6 +64,10 @@ class LightWanRuntime:
             self.process.stdin.write(json.dumps(request).encode() + b"\n")
             await self.process.stdin.drain()
             response = await self._receive()
+            while response.get("status") == "progress":
+                if report is not None:
+                    report(int(response["percent"]))
+                response = await self._receive()
         except BaseException:
             await self.close()
             raise
@@ -128,6 +132,11 @@ def _worker():
         except Exception as error:
             print(json.dumps({"status": "startup_failed", "error_type": type(error).__name__}), file=protocol)
             return
+        def report(value, maximum):
+            percent = round(100 * value / maximum)
+            print(json.dumps({"status": "progress", "percent": percent}), file=protocol)
+
+        pipeline.runner.set_progress_callback(report)
         print(json.dumps({"status": "ready", "gpu": gpu}), file=protocol)
         for line in sys.stdin:
             try:

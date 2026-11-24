@@ -48,6 +48,7 @@ IMAGINE_VIDEO_TOKEN={{ RUNPOD_SECRET_imagine_video_token }}
 IMAGINE_GLOBAL_MOUNT=/workspace-global
 IMAGINE_DOWNLOAD_MODELS=1
 IMAGINE_LIGHTWAN_ENABLE_LONG_VIDEO=1
+IMAGINE_DEBUG_METRICS=1
 ```
 
 Después de comprobar la primera carga, usa `IMAGINE_DOWNLOAD_MODELS=0` en
@@ -65,7 +66,8 @@ capacidad para pesos. Confirma la franquicia y tarifa en tu cuenta de RunPod.
 [Artefactos de LightWan](https://huggingface.co/lightx2v/LightWan2.2-A14B/tree/a6f09bcd5ffbd079e7397cb7c185691a13445af7)
 [Componentes Wan fijados](https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B/tree/206a9ee1b7bfaaf8f7e4d81335650533490646a3)
 
-Desde una terminal del Pod:
+Busca `imagine_metric` en los logs para medir staging, carga, inferencia y
+tiempo total. Desde una terminal del Pod:
 
 ```bash
 printf 'header = "Authorization: Bearer %s"\n' "$IMAGINE_VIDEO_TOKEN" |

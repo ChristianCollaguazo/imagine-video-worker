@@ -16,5 +16,9 @@ assert capability == (12, 0), f"This NVFP4 LightWan build targets SM120, got com
 print(f"LightWan GPU: {torch.cuda.get_device_name(0)}; compute capability {capability}; PyTorch {torch.__version__}", flush=True)
 PY
 
+stage_started=$SECONDS
 python docker/stage_models.py
+if [[ "${IMAGINE_DEBUG_METRICS:-0}" == "1" ]]; then
+  printf 'imagine_metric {"event":"model_staging_finished","seconds":%s}\n' "$((SECONDS-stage_started))"
+fi
 exec bash scripts/start.sh

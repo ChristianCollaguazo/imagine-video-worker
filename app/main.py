@@ -25,6 +25,7 @@ RETENTION_SECONDS = 15 * 60
 MAX_PIXELS = 40_000_000
 LONG_VIDEO_ENABLED = os.environ.get("IMAGINE_LIGHTWAN_ENABLE_LONG_VIDEO", "0") == "1"
 FPS = 16
+DEBUG_METRICS = os.environ.get("IMAGINE_DEBUG_METRICS", "0") == "1"
 
 app = FastAPI(title="Imagine Video Worker", docs_url=None, redoc_url=None)
 runtime = LightWanRuntime()
@@ -36,6 +37,11 @@ admission_lock = asyncio.Lock()
 admission_reserved = False
 worker_task: asyncio.Task | None = None
 reaper_task: asyncio.Task | None = None
+
+
+def _metric(event: str, **values):
+    if DEBUG_METRICS:
+        print("imagine_metric " + json.dumps({"event": event, **values}, sort_keys=True), flush=True)
 
 
 def _authorized(authorization: str | None) -> None:
@@ -186,7 +192,8 @@ async def _run_job(job_id: str) -> None:
         return
     async with slot_lock:
         cancel_event = job["cancel_event"]
-        deadline = time.monotonic() + JOB_TIMEOUT_SECONDS
+        started = time.monotonic()
+        deadline = started + JOB_TIMEOUT_SECONDS
         try:
             if cancel_event.is_set():
                 return
@@ -196,14 +203,20 @@ async def _run_job(job_id: str) -> None:
             raw_path = job["folder"] / "lightwan-output.mp4"
             result_path = job["folder"] / "result.mp4"
             job.update(stage="generating_video", progress=10, backend_active=True)
+
+            def report(percent: int):
+                if not cancel_event.is_set():
+                    job["progress"] = 10 + round(70 * max(0, min(100, percent)) / 100)
+
             if not await _wait_or_cancel(
                 runtime.generate(
                     prompt=job.pop("prompt"), image_path=job["input_path"], output_path=raw_path,
-                    seed=job["seed"], height=height, width=width, model_frames=model_frames,
+                    seed=job["seed"], height=height, width=width, model_frames=model_frames, report=report,
                 ),
                 cancel_event, JOB_TIMEOUT_SECONDS,
             ):
                 return
+            _metric("lightwan_inference", seconds=round(time.monotonic() - started, 3))
             job["input_path"].unlink(missing_ok=True)
             if not raw_path.is_file() or raw_path.stat().st_size == 0:
                 raise RuntimeError("LightX2V finished without a video file")
@@ -226,6 +239,7 @@ async def _run_job(job_id: str) -> None:
             job["backend_active"] = False
             if job["status"] != "completed":
                 _cleanup(job)
+            _metric("generation_finished", status=job["status"], seconds=round(time.monotonic() - started, 3))
             queue.task_done()
 
 
@@ -265,8 +279,10 @@ async def startup() -> None:
             child.unlink(missing_ok=True)
     if not TOKEN:
         raise RuntimeError("Configure IMAGINE_VIDEO_TOKEN")
+    started = time.monotonic()
     await runtime.load()
     print("LightWan runtime ready", flush=True)
+    _metric("lightwan_model_load", seconds=round(time.monotonic() - started, 3))
     global worker_task, reaper_task
     worker_task = asyncio.create_task(_worker())
     reaper_task = asyncio.create_task(_reaper())
