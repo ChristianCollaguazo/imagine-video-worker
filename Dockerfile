@@ -17,11 +17,13 @@ WORKDIR /opt/imagine-video-worker
 ENV PYTHONPATH=/opt/LightX2V:/opt/imagine-video-worker
 COPY config/ ./config/
 COPY requirements.txt ./requirements.txt
-RUN git init /opt/LightX2V && cd /opt/LightX2V && \
+RUN git init /tmp/lightx2v-src && cd /tmp/lightx2v-src && \
     git remote add origin https://github.com/ModelTC/LightX2V.git && \
     git fetch --depth 1 origin tag 0.6.0 && git checkout --detach FETCH_HEAD && \
     test "$(git rev-parse HEAD)" = "94f0f19459e66f61a723db7690f1707f308599ef" && \
-    rm -rf .git docs examples scripts tests lightx2v_kernel && \
+    mkdir /opt/LightX2V && cp -a lightx2v lightx2v_platform LICENSE /opt/LightX2V/ && \
+    cd /opt/imagine-video-worker && rm -rf /tmp/lightx2v-src && \
+    find /app /opt -name .DS_Store -type f -delete && \
     python -m pip install -r /opt/imagine-video-worker/requirements.txt && \
     python -c "import fastapi, gguf, huggingface_hub, prometheus_client, sentencepiece, uvicorn; from PIL import Image" && \
     command -v ffmpeg && command -v ffprobe
