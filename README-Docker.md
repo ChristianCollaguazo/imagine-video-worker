@@ -4,13 +4,18 @@ LightX2V proporciona el camino oficial NVFP4 de cuatro pasos, dos por cada
 experto, y atención dispersa Sage2. El preset publicado usa 81 cuadros a
 480 × 832. Los tiempos de inferencia publicados para RTX 5090 son una
 referencia del proyecto y corresponden a su propia prueba. La configuración
-de 720p y las longitudes de 10 y 15 s requieren validación con este worker en
-la RTX PRO 6000.
+de 720p y las duraciones de 3 a 30 s requieren validación con este worker en
+la RTX PRO 6000. El rango de duración es una política experimental de la API;
+no representa un rango de calidad o rendimiento validado por el modelo. Cuando
+la opción está activa, health informa los valores aceptados por la API y los
+marca como experimentales.
 
 La API acepta la pareja `turbo`/8 que envía Imagine y reporta los cuatro
-pasos internos por separado. A 16 FPS, LightX2V solicita 161 o 241 cuadros
-por la restricción temporal `4n+1` y el MP4 conserva los primeros 160 o 240.
-Esta ruta es experimental. La salida es silenciosa.
+pasos internos por separado. Se elige la duración en pasos de un segundo. A
+16 FPS, LightX2V solicita un cuadro adicional por la restricción temporal
+`4n+1` y el exportador recorta el último cuadro para conservar la duración
+solicitada. No se cambia la velocidad ni se interpolan cuadros. Los MP4 no
+incluyen audio. Esta ruta es experimental.
 [LightWan y licencia Apache 2.0](https://huggingface.co/lightx2v/LightWan2.2-A14B)
 [Runtime oficial LightX2V](https://github.com/ModelTC/LightX2V)
 [Preset oficial NVFP4 con atención dispersa](https://github.com/ModelTC/LightX2V/blob/main/configs/wan22/extreme/wan_moe_i2v_distill_nvfp4_sparse_attn.json)
