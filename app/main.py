@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .comfy import ComfyClient, ModelLoaderError, new_client_id
-from .lora_catalog import available_lora_names, resolve_lora_name
+from .lora_catalog import available_lora_names, resolve_lora_name, resolve_lora_stack
 from .workflow import (
     DEFAULT_RESOLUTION,
     SUPPORTED_DURATIONS,
@@ -115,7 +115,7 @@ async def token_gate(request, call_next):
 
 
 def _snapshot(job: dict[str, Any]) -> dict[str, Any]:
-    return {key: job.get(key) for key in ("id", "status", "stage", "progress", "error", "steps", "mode", "resolution", "effective_width", "effective_height", "lora_name", "lora_strength")}
+    return {key: job.get(key) for key in ("id", "status", "stage", "progress", "error", "steps", "mode", "resolution", "effective_width", "effective_height", "lora_name", "lora_strength", "lora_stack")}
 
 
 def _available_lora_names() -> list[str]:
@@ -235,7 +235,7 @@ async def _run_job(job_id: str):
             generation_state="initial" if generation_number == 1 else "subsequent",
             mode=job["mode"], steps=job["steps"], resolution=job["resolution"],
             effective_width=job["effective_width"], effective_height=job["effective_height"],
-            lora_name=job.get("lora_name"), lora_strength=job["lora_strength"],
+            lora_name=job.get("lora_name"), lora_strength=job["lora_strength"], lora_stack=job["lora_stack"],
         )
         job["status"], job["stage"], job["progress"] = "running", "uploading_photo", None
         try:
@@ -252,13 +252,13 @@ async def _run_job(job_id: str):
                 return
             job["stage"], job["progress"] = "generating_video", None
             phase_started = time.perf_counter()
-            if job.get("lora_name") and not (COMFY_ROOT / "models" / "loras" / job["lora_name"]).is_file():
-                raise RuntimeError("Selected LoRA is no longer available")
+            if any(not (COMFY_ROOT / "models" / "loras" / item["name"]).is_file() for item in job["lora_stack"]):
+                raise RuntimeError("A selected LoRA is no longer available")
             workflow = build_workflow(
                 job["prompt"], comfy_name, job["duration_seconds"], job["seed"],
                 job["image_width"], job["image_height"], job["id"],
                 steps=job["steps"], audio=AUDIO, resolution=job["resolution"],
-                lora_name=job.get("lora_name"), lora_strength=job["lora_strength"],
+                lora_name=job.get("lora_name"), lora_strength=job["lora_strength"], lora_stack=job["lora_stack"],
             )
             job.pop("prompt", None)
             client_id = new_client_id()
@@ -603,6 +603,7 @@ async def create_job(
     resolution: int = Form(DEFAULT_RESOLUTION),
     lora_name: str | None = Form(None),
     lora_strength: float = Form(1.0),
+    lora_stack: str | None = Form(None),
     authorization: str | None = Header(None),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
 ):
@@ -613,18 +614,25 @@ async def create_job(
         raise HTTPException(422, "mode must be base or turbo")
     if resolution not in SUPPORTED_RESOLUTIONS:
         raise HTTPException(422, "resolution must be 480, 576, or 768")
-    if not math.isfinite(lora_strength) or not 0.0 <= lora_strength <= 2.0:
+    if lora_stack is None and (not math.isfinite(lora_strength) or not 0.0 <= lora_strength <= 2.0):
         raise HTTPException(422, "lora_strength must be between 0 and 2")
     available_loras = _available_lora_names()
-    if mode == "turbo" and not lora_name and TURBO_LORA not in available_loras:
+    if mode == "turbo" and lora_stack is None and not lora_name and TURBO_LORA not in available_loras:
         raise HTTPException(503, "Turbo mode is unavailable because its default LoRA is not installed")
     try:
-        selected_lora = _resolve_lora_name(mode, lora_name, available_loras)
+        if lora_stack is not None:
+            if lora_name is not None:
+                raise ValueError("Use either lora_stack or legacy lora_name/lora_strength, not both")
+            selected_stack = resolve_lora_stack(mode, json.loads(lora_stack), available_loras, TURBO_LORA)
+        elif lora_name:
+            selected_stack = resolve_lora_stack(mode, [{"name": lora_name, "strength": lora_strength}], available_loras, TURBO_LORA)
+        else:
+            selected_stack = resolve_lora_stack(mode, None, available_loras, TURBO_LORA)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
-    if mode == "turbo" and not selected_lora:
-        raise HTTPException(503, "Turbo mode is unavailable because no LoRA is installed")
-    if selected_lora:
+    except (TypeError, json.JSONDecodeError):
+        raise HTTPException(422, "lora_stack must be a JSON array") from None
+    if selected_stack:
         try:
             available_nodes = await comfy.health()
         except Exception:
@@ -635,9 +643,8 @@ async def create_job(
         selected_steps = 8 if steps is None and mode == "turbo" else sampling_steps(steps, default=12)
     except ValueError as exc:
         raise HTTPException(422, "steps must be an integer from 1 to 50") from exc
-    prompt = prompt.strip()
-    if not prompt or len(prompt) > 2000:
-        raise HTTPException(422, "Prompt must contain 1 to 2000 characters")
+    if not prompt.strip() or len(prompt) > 10000:
+        raise HTTPException(422, "Prompt must contain 1 to 10000 characters")
     if idempotency_key:
         if len(idempotency_key) > 200:
             raise HTTPException(422, "Idempotency-Key is too long")
@@ -667,7 +674,9 @@ async def create_job(
         input_path.rename(renamed)
         input_path = renamed
     effective_width, effective_height = canvas_for_image(image_width, image_height, resolution)
-    job = {"id": job_id, "status": "queued", "stage": "queued", "progress": 0, "error": None, "prompt": prompt, "duration_seconds": duration_seconds, "steps": selected_steps, "mode": mode, "resolution": resolution, "effective_width": effective_width, "effective_height": effective_height, "lora_name": selected_lora, "lora_strength": float(lora_strength), "folder": folder, "input_path": input_path, "created_at": time.time(), "input_sha256": digest, "seed": int.from_bytes(os.urandom(8), "big"), "image_width": image_width, "image_height": image_height, "cancel_event": asyncio.Event()}
+    legacy_name = selected_stack[0]["name"] if len(selected_stack) == 1 else None
+    legacy_strength = selected_stack[0]["strength"] if len(selected_stack) == 1 else float(lora_strength)
+    job = {"id": job_id, "status": "queued", "stage": "queued", "progress": 0, "error": None, "prompt": prompt, "duration_seconds": duration_seconds, "steps": selected_steps, "mode": mode, "resolution": resolution, "effective_width": effective_width, "effective_height": effective_height, "lora_name": legacy_name, "lora_strength": legacy_strength, "lora_stack": selected_stack, "folder": folder, "input_path": input_path, "created_at": time.time(), "input_sha256": digest, "seed": int.from_bytes(os.urandom(8), "big"), "image_width": image_width, "image_height": image_height, "cancel_event": asyncio.Event()}
     jobs[job_id] = job
     if idempotency_key:
         idempotency[idempotency_key] = job_id

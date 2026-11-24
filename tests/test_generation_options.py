@@ -2,7 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from app.lora_catalog import available_lora_names, resolve_lora_name
+from app.lora_catalog import available_lora_names, resolve_lora_name, resolve_lora_stack
 from app.workflow import build_workflow, canvas_for_image, sampling_steps
 
 
@@ -64,6 +64,36 @@ class GenerationOptionsTests(unittest.TestCase):
         for name in ("../other.safetensors", "x/other.safetensors", "\\other.safetensors"):
             with self.assertRaises(ValueError):
                 resolve_lora_name("base", name, catalog, default_lora)
+
+    def test_lora_stack_preserves_order_and_validates_entries(self):
+        names = ["one.safetensors", "two.safetensors"]
+        stack = [
+            {"name": names[0], "strength": 0.35},
+            {"name": names[1], "strength": 1.25},
+        ]
+        self.assertEqual(resolve_lora_stack("base", stack, names, "default.safetensors"), stack)
+        self.assertEqual(resolve_lora_stack("turbo", None, names + ["default.safetensors"], "default.safetensors"), [{"name": "default.safetensors", "strength": 1.0}])
+        self.assertEqual(resolve_lora_stack("turbo", [], names, "default.safetensors"), [])
+        for invalid in (
+            [{"name": names[0], "strength": 1}, {"name": names[0], "strength": 1}],
+            [{"name": "../one.safetensors", "strength": 1}],
+            [{"name": names[0], "strength": 2.01}],
+            [{"name": names[0], "strength": True}],
+            [{"name": names[0], "strength": 1, "extra": "x"}],
+        ):
+            with self.assertRaises(ValueError):
+                resolve_lora_stack("base", invalid, names, "default.safetensors")
+
+    def test_workflow_chains_multiple_loras_in_requested_order(self):
+        workflow = build_workflow(
+            "x" * 10000, "input.png", 10, 1, 16, 9, "job", steps=8,
+            lora_stack=[{"name": "one.safetensors", "strength": 0.25}, {"name": "two.safetensors", "strength": 1.5}],
+        )
+        self.assertEqual(workflow["6"]["inputs"]["prompt"], "x" * 10000)
+        self.assertEqual(workflow["16"]["inputs"], {"model": ["1", 0], "lora_name": "one.safetensors", "strength_model": 0.25})
+        self.assertEqual(workflow["17"]["inputs"], {"model": ["16", 0], "lora_name": "two.safetensors", "strength_model": 1.5})
+        self.assertEqual(workflow["7"]["inputs"]["model"], ["17", 0])
+        self.assertEqual(workflow["10"]["inputs"]["model"], ["17", 0])
 
 
 if __name__ == "__main__":

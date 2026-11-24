@@ -88,6 +88,7 @@ def build_workflow(
     resolution: int = DEFAULT_RESOLUTION,
     lora_name: str | None = None,
     lora_strength: float = 1.0,
+    lora_stack: list[dict] | None = None,
 ) -> dict:
     """Build the ComfyUI API prompt graph for one image plus one prompt."""
     if not prompt.strip():
@@ -125,13 +126,18 @@ def build_workflow(
             "format.codec.encoding": "re-encode", "format.codec.encoding.crf": 18,
         }},
     }
-    if lora_name:
-        graph["16"] = {
+    stack = lora_stack if lora_stack is not None else ([{"name": lora_name, "strength": lora_strength}] if lora_name else [])
+    previous_model = ["1", 0]
+    for index, entry in enumerate(stack):
+        node_id = str(16 + index)
+        graph[node_id] = {
             "class_type": "LoraLoaderModelOnly",
-            "inputs": {"model": ["1", 0], "lora_name": lora_name, "strength_model": float(lora_strength)},
+            "inputs": {"model": previous_model, "lora_name": entry["name"], "strength_model": float(entry["strength"])},
         }
-        graph["7"]["inputs"]["model"] = ["16", 0]
-        graph["10"]["inputs"]["model"] = ["16", 0]
+        previous_model = [node_id, 0]
+    if stack:
+        graph["7"]["inputs"]["model"] = previous_model
+        graph["10"]["inputs"]["model"] = previous_model
     if not audio:
         # FL2VA still generates joint latents. Only skip decoding and muxing the audio.
         del graph["4"]

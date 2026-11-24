@@ -88,6 +88,8 @@ Cada petición de trabajo necesita `Authorization: Bearer <IMAGINE_VIDEO_TOKEN>`
 | `POST /v1/jobs/{id}/ack` | Confirmar importación | Borra la copia remota del resultado y vence el trabajo |
 | `DELETE /v1/jobs/{id}` | Cancelar o purgar | Interrumpe el trabajo y borra sus temporales |
 
+`prompt` acepta de 1 a 10.000 caracteres y el worker lo pasa completo a ComfyUI sin recortarlo. El encoder Qwen3VL puede hacer que prompts largos consuman más tiempo y memoria; el límite interno de contexto efectivo no está fijado aquí. LoRAs disponibles se redescubren en cada consulta de `GET /v1/loras`. `POST /v1/jobs` acepta el campo multipart opcional `lora_stack` como un array JSON ordenado, por ejemplo `[{"name":"style.safetensors","strength":0.7},{"name":"motion.safetensors","strength":1.1}]`; cada entrada se aplica secuencialmente al modelo. Los nombres deben ser basenames instalados, no se permiten duplicados y cada intensidad debe estar entre 0 y 2. `lora_stack=[]` desactiva LoRAs. Si se omite, se conserva el comportamiento de modo actual (Turbo usa su LoRA por defecto; Base no aplica una). Los campos anteriores `lora_name` y `lora_strength` siguen aceptándose para clientes con una sola LoRA; no se pueden combinar con `lora_stack`.
+
 El resultado se conserva hasta que se confirme con ACK o caduque: 15 minutos de retención, revisados por un barrido cada 30 segundos. `IMAGINE_VIDEO_JOB_TIMEOUT_SECONDS` ajusta el límite de generación; por defecto es 5400 segundos (90 minutos; mínimo 60). El token también se exige en salud. No se registran prompts ni medios en logs persistentes.
 
 Comprueba la salud:
