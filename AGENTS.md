@@ -8,9 +8,10 @@ This branch contains H3 only. The MVP 1 base is commit `1a0eb25`, image tag
 - `docker/entrypoint.sh` prepares models and supervises services from
   `scripts/start.sh`. `docker/stage_models.py` reads the five manifest-pinned
   weights from `/workspace-global/imagine-h3-turbo/models`.
-- `IMAGINE_MODEL_STORAGE_MODE=local|direct` defaults to `local`. Direct mode
+- `IMAGINE_MODEL_STORAGE_MODE=local|direct|download` defaults to `local`. Direct mode
   uses per-file symlinks into Global Volume and fails closed; no silent local
-  copy fallback. `IMAGINE_MODEL_VERIFY_MODE=full|cached|size` defaults to
+  copy fallback. Download mode requires `IMAGINE_DOWNLOAD_MODELS=1` and
+  verifies the five pinned weights on container disk without touching a volume. `IMAGINE_MODEL_VERIFY_MODE=full|cached|size` defaults to
   `full`; only `full` is cryptographic verification on each run. Cached receipts
   are metadata-based and cannot detect same-size changes with unchanged metadata.
 - Global Volume is object-backed and does not promise full POSIX or high

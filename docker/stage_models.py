@@ -6,6 +6,11 @@ exact match of the pinned manifest plus available size and mtime metadata.
 """
 from __future__ import annotations
 
+if __package__:
+    from .model_downloader import download_pinned_models
+else:
+    from model_downloader import download_pinned_models
+
 import hashlib
 import json
 import mmap
@@ -27,7 +32,7 @@ RECEIPT_DIR = MOUNT / "imagine-h3-turbo" / ".verification-receipts"
 BLOCK_SIZE = 8 * 1024**2
 RECEIPT_LIMIT = 1024 * 1024
 MIN_SCRATCH_BYTES = 10 * 1024**3
-STORAGE_MODES = {"local", "direct"}
+STORAGE_MODES = {"local", "direct", "download"}
 VERIFY_MODES = {"full", "cached", "size"}
 
 
@@ -305,7 +310,7 @@ def prepare(*, storage_mode: str | None = None, verification_mode: str | None = 
     storage_requested = storage_mode or os.environ.get("IMAGINE_MODEL_STORAGE_MODE", "local").strip().lower()
     verify_requested = verification_mode or os.environ.get("IMAGINE_MODEL_VERIFY_MODE", "full").strip().lower()
     if storage_requested not in STORAGE_MODES:
-        raise RuntimeError("IMAGINE_MODEL_STORAGE_MODE must be local or direct; auto is intentionally unsupported")
+        raise RuntimeError("IMAGINE_MODEL_STORAGE_MODE must be local, direct, or download; auto is intentionally unsupported")
     if verify_requested not in VERIFY_MODES:
         raise RuntimeError("IMAGINE_MODEL_VERIFY_MODE must be full, cached, or size")
     mount = mount or MOUNT
@@ -322,9 +327,6 @@ def prepare(*, storage_mode: str | None = None, verification_mode: str | None = 
         "files_size_only": 0, "metadata_unreliable": 0,
         "mmap_probe_seconds": 0.0, "receipts_written": 0,
     }
-    mount_started = time.perf_counter()
-    (mount_check or _check_mount)(mount)
-    metrics["mount_check_seconds"] = time.perf_counter() - mount_started
     try:
         manifest_bytes = manifest_path.read_bytes()
         manifest = json.loads(manifest_bytes)
@@ -332,6 +334,24 @@ def prepare(*, storage_mode: str | None = None, verification_mode: str | None = 
         raise RuntimeError(f"Cannot read H3 model manifest: {exc}") from None
     items = _manifest_models(manifest)
     manifest_sha = _manifest_digest(manifest_bytes)
+    if storage_requested == "download":
+        if os.environ.get("IMAGINE_DOWNLOAD_MODELS", "0") != "1":
+            raise RuntimeError("IMAGINE_MODEL_STORAGE_MODE=download requires IMAGINE_DOWNLOAD_MODELS=1")
+        metrics.update(download_pinned_models(items, local_root))
+        metrics.update(
+            seconds=time.perf_counter() - started,
+            storage_mode_requested=storage_requested,
+            storage_mode=storage_requested,
+            verification_mode_requested=verify_requested,
+            verification_mode="full",
+            files_full=metrics["files_downloaded"] + metrics["files_reused"],
+            manifest_sha256=manifest_sha,
+        )
+        return metrics
+
+    mount_started = time.perf_counter()
+    (mount_check or _check_mount)(mount)
+    metrics["mount_check_seconds"] = time.perf_counter() - mount_started
     receipt_usable = False
     if verify_requested == "cached":
         try:

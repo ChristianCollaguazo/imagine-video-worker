@@ -13,6 +13,26 @@ validarse en GPU. El
 Dockerfile se basa en el digest linux/amd64 de `turbo-v1` para conservar
 las versiones exactas del runtime que ya se usó en RunPod.
 
+## RunPod sin Global Volume
+
+Usa `christiancollaguazo/imagine-video-worker:h3-optimized-v2-download`, Container Disk de 100 GB,
+puerto HTTP 8000 y conserva el secreto del worker. Para esta modalidad, deja
+Global Volume sin adjuntar y configura:
+
+```dotenv
+IMAGINE_VIDEO_TOKEN={{ RUNPOD_SECRET_imagine_video_token }}
+IMAGINE_MODEL_STORAGE_MODE=download
+IMAGINE_DOWNLOAD_MODELS=1
+IMAGINE_DEBUG_METRICS=1
+```
+
+El arranque descarga los cinco archivos fijados (42.03 GB), comprueba tamaño y
+SHA-256 y solo entonces inicia ComfyUI. Los archivos válidos se reutilizan al
+reiniciar el mismo contenedor. Un Pod nuevo descarga de nuevo. El evento
+`model_staging_finished` registra `download_seconds`, `verification_seconds`
+y `bytes_downloaded`. La API admite duraciones enteras de 3 a 30 segundos.
+El rendimiento y la calidad de las duraciones extremas requieren pruebas en GPU.
+
 ## Mac
 
 Desde el worktree `feature/h3-performance-optimization`, con Docker Desktop
@@ -21,8 +41,8 @@ activo y la sesión de Docker Hub iniciada:
 ```bash
 docker buildx build --platform linux/amd64 \
   --build-arg IMAGINE_SOURCE_COMMIT="$(git rev-parse HEAD)" \
-  -t christiancollaguazo/imagine-video-worker:h3-optimized-v2 --push .
-docker buildx imagetools inspect christiancollaguazo/imagine-video-worker:h3-optimized-v2
+  -t christiancollaguazo/imagine-video-worker:h3-optimized-v2-download --push .
+docker buildx imagetools inspect christiancollaguazo/imagine-video-worker:h3-optimized-v2-download
 ```
 
 En el `.env` local de Imagine, configura la URL del Pod y conserva el token
