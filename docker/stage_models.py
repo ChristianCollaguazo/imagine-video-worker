@@ -1,84 +1,129 @@
-"""Stage verified H3 Turbo model files onto local POSIX disk; persist only weights."""
+"""Stage only the pinned LightWan I2V runtime files from the Global Volume."""
+from __future__ import annotations
+
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-LOCAL = ROOT / "ComfyUI" / "models"
 MOUNT = Path(os.environ.get("IMAGINE_GLOBAL_MOUNT", "/workspace-global"))
-REMOTE = MOUNT / "imagine-h3-turbo" / "models"
+MODEL_ROOT_NAME = "Wan2.2-I2V-A14B"
+LOCAL = Path(os.environ.get("LIGHTWAN_MODEL_DIR", "/opt/imagine/models/Wan2.2-I2V-A14B"))
+REMOTE = MOUNT / "imagine-lightwan" / "models" / MODEL_ROOT_NAME
 DOWNLOAD = os.environ.get("IMAGINE_DOWNLOAD_MODELS", "0") == "1"
 
 
-def valid(path, expected):
+def digest(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def is_valid(path: Path, item: dict) -> bool:
     if not path.is_file():
         return False
-    with path.open("rb") as f:
-        return hashlib.file_digest(f, "sha256").hexdigest() == expected.lower()
+    if item.get("sha256"):
+        return digest(path) == item["sha256"].lower()
+    expected = item.get("bytes")
+    if expected is not None:
+        return path.stat().st_size == expected
+    expected = item.get("bytes_approx")
+    return expected is not None and abs(path.stat().st_size - expected) <= expected * 0.02
 
 
-def main():
+def copy_verified(source: Path, destination: Path, item: dict) -> None:
+    partial = destination.with_name(destination.name + ".part")
+    try:
+        shutil.copyfile(source, partial)
+        if not is_valid(partial, item):
+            raise SystemExit(f"Integrity check failed for {item['path']}")
+        partial.replace(destination)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def download_verified(item: dict, destination: Path) -> None:
+    from huggingface_hub import hf_hub_download
+
+    cached = Path(hf_hub_download(
+        repo_id=item["repo"],
+        filename=item["name"],
+        revision=item["revision"],
+        cache_dir="/tmp/imagine-hf",
+    ))
+    if not is_valid(cached, item):
+        raise SystemExit(f"Downloaded file failed integrity check: {item['path']}")
+    copy_verified(cached, destination, item)
+
+
+def main() -> None:
     if not MOUNT.is_absolute() or MOUNT == Path("/"):
         raise SystemExit("Invalid IMAGINE_GLOBAL_MOUNT")
     if subprocess.run(["mountpoint", "-q", str(MOUNT)]).returncode:
         raise SystemExit(f"No volume mounted at {MOUNT}; check RunPod mount path")
+
     manifest = json.loads((ROOT / "config/model-manifest.json").read_text())
-    shared = manifest["models"]
-    turbo = [x for x in manifest.get("optional_models", []) if x["id"] == "fl2v_turbo_lora_8step"]
-    if len(turbo) != 1 or not any("pruned_int8_convrot" in x["path"] for x in shared):
-        raise SystemExit("Expected quantized H3 + 8-step Turbo manifest; refusing other models")
-    models = shared + turbo
-    if any(not x.get("sha256") or not x.get("repo") or not x.get("revision") for x in models):
-        raise SystemExit("Manifest must pin repo, revision and SHA-256 for each model")
+    if manifest.get("model_root") != MODEL_ROOT_NAME or len(manifest.get("models", [])) != 9:
+        raise SystemExit("Unexpected LightWan manifest; refusing to stage other model families")
+    if any(not item.get("sha256") and not item.get("bytes") for item in manifest["models"]):
+        raise SystemExit("Every model object needs a pinned SHA-256 or exact size")
+
+    # Keep staging on local disk. The Global Volume contains only model files.
+    LOCAL.parent.mkdir(parents=True, exist_ok=True)
+    pending = sum(
+        item.get("bytes", item.get("bytes_approx", 0))
+        for item in manifest["models"]
+        if not is_valid(LOCAL / item["path"], item)
+    )
+    local_download_cache = pending if DOWNLOAD else 0
+    if shutil.disk_usage(LOCAL.parent).free < pending + local_download_cache + 12 * 1024**3:
+        raise SystemExit("Insufficient local container disk for weights and inference scratch")
+    global_pending = sum(
+        item.get("bytes", item.get("bytes_approx", 0))
+        for item in manifest["models"]
+        if not (REMOTE / item["path"]).is_file()
+    )
+    if global_pending > shutil.disk_usage(MOUNT).free:
+        raise SystemExit("Insufficient Global Volume space for the LightWan model files")
+
     LOCAL.mkdir(parents=True, exist_ok=True)
-    pending = sum(x["bytes_approx"] for x in models if not (LOCAL / x["path"]).is_file())
-    if shutil.disk_usage(LOCAL).free < pending + 10 * 1024**3:
-        raise SystemExit("Insufficient local container disk for weights + scratch; increase disk")
-    for item in models:
+    for item in manifest["models"]:
         rel = Path(item["path"])
         if rel.is_absolute() or ".." in rel.parts:
-            raise SystemExit("Invalid manifest model path")
-        dest = LOCAL / rel
-        remote = REMOTE / rel
-        digest = item["sha256"]
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if not valid(dest, digest):
-            dest.unlink(missing_ok=True)
-            if remote.is_file():
-                print(f"Staging from Global Volume: {rel}", flush=True)
-                partial = dest.with_name(dest.name + ".part")
-                try:
-                    shutil.copyfile(remote, partial)
-                    if not valid(partial, digest):
-                        raise SystemExit(f"Corrupt Global Volume object: {remote}. Remove that object explicitly before retrying.")
-                    partial.replace(dest)
-                finally:
-                    partial.unlink(missing_ok=True)
+            raise SystemExit("Invalid model path in manifest")
+        local_file, global_file = LOCAL / rel, REMOTE / rel
+        local_file.parent.mkdir(parents=True, exist_ok=True)
+        if not is_valid(local_file, item):
+            local_file.unlink(missing_ok=True)
+            if global_file.is_file():
+                print(f"Staging verified model from Global Volume: {rel}", flush=True)
+                copy_verified(global_file, local_file, item)
             elif DOWNLOAD:
-                from huggingface_hub import hf_hub_download
-                print(f"Downloading pinned model: {rel}", flush=True)
-                path = Path(hf_hub_download(repo_id=item["repo"], filename=str(rel), revision=item["revision"], local_dir=LOCAL))
-                if path != dest or not valid(dest, digest):
-                    dest.unlink(missing_ok=True)
-                    raise SystemExit(f"Downloaded file failed verification: {rel}")
+                print(f"Downloading pinned model object: {rel}", flush=True)
+                download_verified(item, local_file)
             else:
-                raise SystemExit(f"Missing {remote}; set IMAGINE_DOWNLOAD_MODELS=1 for initial population")
-        if not remote.is_file():
+                raise SystemExit(f"Missing {global_file}; set IMAGINE_DOWNLOAD_MODELS=1 for initial population")
+
+        if not global_file.is_file():
             if not DOWNLOAD:
-                raise SystemExit(f"Missing persistent copy {remote}; enable initial population")
-            print(f"Saving verified model to Global Volume: {rel}", flush=True)
-            remote.parent.mkdir(parents=True, exist_ok=True)
-            # Sequential whole-file write; no rename or locking on object-backed mount.
-            with dest.open("rb") as src, remote.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=8 * 1024**2)
-            if remote.stat().st_size != dest.stat().st_size:
+                raise SystemExit(f"Missing persistent copy {global_file}; enable initial population")
+            print(f"Persisting verified model object: {rel}", flush=True)
+            global_file.parent.mkdir(parents=True, exist_ok=True)
+            # RunPod Global Volumes can be object-backed; write sequentially, then
+            # validate the stored size. The next pod startup re-hashes it on staging.
+            with local_file.open("rb") as source, global_file.open("wb") as destination:
+                shutil.copyfileobj(source, destination, length=8 * 1024**2)
+            expected = item.get("bytes", item.get("bytes_approx", 0))
+            if item.get("bytes") is not None and global_file.stat().st_size != expected:
+                raise SystemExit(f"Persistent copy size mismatch: {rel}")
+            if item.get("bytes_approx") is not None and abs(global_file.stat().st_size - expected) > expected * 0.02:
                 raise SystemExit(f"Persistent copy size mismatch: {rel}")
         print(f"Ready: {rel}", flush=True)
-    print("All Turbo weights staged and verified locally", flush=True)
+
+    shutil.rmtree("/tmp/imagine-hf", ignore_errors=True)
+    print("All LightWan model files staged and verified", flush=True)
 
 
 if __name__ == "__main__":

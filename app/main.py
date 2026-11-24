@@ -1,10 +1,8 @@
-"""Ephemeral, single-slot API for private image-to-video generation."""
+"""Private, single-slot Imagine API backed by LightWan through LightX2V."""
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import hmac
-import json
 import os
 import shutil
 import time
@@ -16,25 +14,19 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from .comfy import ComfyClient, new_client_id
-from .workflow import TURBO_LORA, build_turbo_workflow, build_workflow, sampling_steps
+from .lightwan import LightWanRuntime
 
 TOKEN = os.environ.get("IMAGINE_VIDEO_TOKEN", "")
-COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
-COMFY_WS = os.environ.get("COMFY_WS", COMFY_URL.replace("http://", "ws://").replace("https://", "wss://") + "/ws")
-WORKER_ROOT = Path(__file__).resolve().parents[1]
-COMFY_ROOT = Path(os.environ.get("COMFY_ROOT", str(WORKER_ROOT / "ComfyUI")))
-COMFY_INPUT_DIR = Path(os.environ.get("COMFY_INPUT_DIR", str(COMFY_ROOT / "input")))
-COMFY_OUTPUT_DIR = Path(os.environ.get("COMFY_OUTPUT_DIR", str(COMFY_ROOT / "output")))
-COMFY_TEMP_DIR = Path(os.environ.get("COMFY_TEMP_DIR", str(COMFY_ROOT / "temp")))
 DATA_ROOT = Path(os.environ.get("IMAGINE_VIDEO_DATA", "/tmp/imagine-video-worker"))
 MAX_UPLOAD_BYTES = int(os.environ.get("IMAGINE_VIDEO_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 JOB_TIMEOUT_SECONDS = max(60, int(os.environ.get("IMAGINE_VIDEO_JOB_TIMEOUT_SECONDS", str(90 * 60))))
-MAX_PIXELS = 40_000_000
 RETENTION_SECONDS = 15 * 60
+MAX_PIXELS = 40_000_000
+LONG_VIDEO_ENABLED = os.environ.get("IMAGINE_LIGHTWAN_ENABLE_LONG_VIDEO", "0") == "1"
+FPS = 16
 
 app = FastAPI(title="Imagine Video Worker", docs_url=None, redoc_url=None)
-comfy = ComfyClient(COMFY_URL, COMFY_WS)
+runtime = LightWanRuntime()
 jobs: dict[str, dict[str, Any]] = {}
 idempotency: dict[str, str] = {}
 queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
@@ -45,9 +37,16 @@ worker_task: asyncio.Task | None = None
 reaper_task: asyncio.Task | None = None
 
 
+def _authorized(authorization: str | None) -> None:
+    if not TOKEN:
+        raise HTTPException(503, "Worker token is not configured")
+    scheme, _, supplied = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, TOKEN):
+        raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": "Bearer"})
+
+
 @app.middleware("http")
 async def token_gate(request, call_next):
-    # Reject unauthenticated requests before multipart parsing allocates temp files.
     if request.url.path.startswith("/v1/"):
         try:
             _authorized(request.headers.get("authorization"))
@@ -57,373 +56,250 @@ async def token_gate(request, call_next):
 
 
 def _snapshot(job: dict[str, Any]) -> dict[str, Any]:
-    return {key: job.get(key) for key in ("id", "status", "stage", "progress", "error", "steps", "mode")}
+    return {key: job.get(key) for key in ("id", "status", "stage", "progress", "error", "steps", "mode", "model_steps")}
 
 
-def _authorized(authorization: str | None):
-    if not TOKEN:
-        raise HTTPException(503, "Worker token is not configured")
-    scheme, _, supplied = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, TOKEN):
-        raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": "Bearer"})
+def _cleanup(job: dict[str, Any]) -> None:
+    folder = job.get("folder")
+    if folder:
+        shutil.rmtree(folder, ignore_errors=True)
+    job["result_path"] = None
+    job.pop("prompt", None)
 
 
-async def _bytes_to_file(upload: UploadFile, target: Path) -> tuple[int, str, str, int, int]:
-    total, digest = 0, hashlib.sha256()
-    with target.open("xb") as output:
+def _frame_counts(duration_seconds: int) -> tuple[int, int]:
+    """Wan alignment is 4n+1; encode only the first exact-duration frames."""
+    if duration_seconds not in (10, 15):
+        raise ValueError("duration must be 10 or 15 seconds")
+    output_frames = duration_seconds * FPS
+    model_frames = output_frames + 1
+    if (model_frames - 1) % 4:
+        raise RuntimeError("Computed frame count violates Wan temporal alignment")
+    return model_frames, output_frames
+
+
+def _video_size(width: int, height: int) -> tuple[int, int]:
+    """Keep the input orientation and request an approximately 720p canvas."""
+    ratio = width / height
+    short_edge = 720
+    long_edge = min(1280, max(720, round(max(ratio, 1 / ratio) * short_edge / 32) * 32))
+    if ratio >= 1:
+        return short_edge, long_edge
+    return long_edge, short_edge
+
+
+async def _store_upload(upload: UploadFile, path: Path) -> tuple[int, int]:
+    total = 0
+    with path.open("xb") as output:
         while chunk := await upload.read(1024 * 1024):
             total += len(chunk)
             if total > MAX_UPLOAD_BYTES:
                 raise HTTPException(413, "Photo exceeds the upload limit")
-            digest.update(chunk)
             output.write(chunk)
-    if not total:
+    if total == 0:
         raise HTTPException(422, "Photo is empty")
     try:
-        with Image.open(target) as image:
+        with Image.open(path) as image:
             image.verify()
-        with Image.open(target) as image:
+        with Image.open(path) as image:
             if image.format not in {"JPEG", "PNG", "WEBP"}:
                 raise HTTPException(415, "Upload a JPEG, PNG, or WebP photo")
             if image.width * image.height > MAX_PIXELS:
                 raise HTTPException(413, "Photo dimensions are too large")
-            image_format = image.format
             oriented = ImageOps.exif_transpose(image)
-            image_width, image_height = oriented.size
-            normalized = target.with_suffix(".normalized")
-            if image_format == "JPEG" and oriented.mode not in {"RGB", "L"}:
+            width, height = oriented.size
+            if oriented.mode not in {"RGB", "L"}:
                 oriented = oriented.convert("RGB")
-            oriented.save(normalized, format=image_format)
-        normalized.replace(target)
+            normalized = path.with_name("input-normalized" + path.suffix)
+            oriented.save(normalized, format=image.format)
+        normalized.replace(path)
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
-        raise HTTPException(415, "Uploaded file is not a supported image") from None
-    return total, digest.hexdigest(), image_format, image_width, image_height
+        raise HTTPException(415, "Upload is not a supported image") from None
+    return width, height
 
 
-def _remove_owned_file(root: Path | None, relative: str):
-    if not root:
-        return
-    root = root.resolve()
-    candidate = (root / relative).resolve()
-    if candidate != root and candidate.is_relative_to(root):
-        candidate.unlink(missing_ok=True)
+async def _wait_or_cancel(awaitable, event, timeout):
+    operation = asyncio.create_task(awaitable)
+    cancelled = asyncio.create_task(event.wait())
+    try:
+        done, _ = await asyncio.wait({operation, cancelled}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        if cancelled in done:
+            return False
+        if operation not in done:
+            raise TimeoutError
+        operation.result()
+        return True
+    finally:
+        cancelled.cancel()
+        if not operation.done():
+            operation.cancel()
+        await asyncio.gather(operation, cancelled, return_exceptions=True)
 
 
-def _remove_owned_tree(root: Path | None, relative: str):
-    if not root:
-        return
-    root = root.resolve()
-    candidate = (root / relative).resolve()
-    if candidate != root and candidate.is_relative_to(root):
-        shutil.rmtree(candidate, ignore_errors=True)
+async def _finalize(raw_path, result_path, output_frames):
+    # Trim one generated frame at the native frame rate.
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-protocol_whitelist", "file,pipe", "-i", str(raw_path),
+        "-map", "0:v:0", "-an", "-map_metadata", "-1", "-frames:v", str(output_frames),
+        "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", str(result_path),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        if await process.wait():
+            raise RuntimeError("Video finalization failed")
+    finally:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
 
 
-def _purge_comfy_files(job: dict[str, Any]):
-    if job.get("comfy_name"):
-        _remove_owned_file(COMFY_INPUT_DIR, job["comfy_name"])
-    for info in job.get("remote_outputs", []):
-        root = COMFY_TEMP_DIR if info.get("type") == "temp" else COMFY_OUTPUT_DIR
-        relative = "/".join(part for part in (info.get("subfolder", ""), info.get("filename", "")) if part)
-        _remove_owned_file(root, relative)
-    if job.get("id"):
-        relative = str(Path("imagine_h3") / job["id"])
-        _remove_owned_tree(COMFY_OUTPUT_DIR, relative)
-        _remove_owned_tree(COMFY_TEMP_DIR, relative)
-
-
-def _cleanup(job: dict[str, Any], keep_result: bool = False):
-    folder: Path = job["folder"]
-    result = job.get("result_path") if keep_result else None
-    for child in folder.iterdir() if folder.exists() else ():
-        if result and child == result:
-            continue
-        if child.is_dir():
-            shutil.rmtree(child, ignore_errors=True)
-        else:
-            child.unlink(missing_ok=True)
-    if not keep_result:
-        shutil.rmtree(folder, ignore_errors=True)
-
-
-async def _run_job(job_id: str):
+async def _run_job(job_id: str) -> None:
     job = jobs.get(job_id)
-    if not job or job["status"] != "queued":
+    if not job:
         queue.task_done()
         return
     async with slot_lock:
-        job["status"], job["stage"], job["progress"] = "running", "uploading_photo", None
+        cancel_event = job["cancel_event"]
+        deadline = time.monotonic() + JOB_TIMEOUT_SECONDS
         try:
-            content_type = {".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}[job["input_path"].suffix]
-            upload_name = f"imagine_{job_id}{job['input_path'].suffix}"
-            job["comfy_name"] = upload_name
-            (job["folder"] / "remote.json").write_text(json.dumps({"comfy_name": upload_name}))
-            comfy_name = await comfy.upload(job["input_path"], upload_name, content_type)
-            job["comfy_name"] = comfy_name
-            (job["folder"] / "remote.json").write_text(json.dumps({"comfy_name": comfy_name}))
-            job["input_path"].unlink(missing_ok=True)
-            if job["cancel_event"].is_set():
+            if cancel_event.is_set():
                 return
-            job["stage"], job["progress"] = "generating_video", None
-            if job["mode"] == "turbo":
-                lora_file = COMFY_ROOT / "models" / "loras" / TURBO_LORA
-                if not lora_file.is_file():
-                    raise RuntimeError("Turbo mode requested but its 8-step LoRA is not installed")
-                workflow = build_turbo_workflow(job["prompt"], comfy_name, job["duration_seconds"], job["seed"], job["image_width"], job["image_height"], job["id"])
-            else:
-                workflow = build_workflow(job["prompt"], comfy_name, job["duration_seconds"], job["seed"], job["image_width"], job["image_height"], job["id"], steps=job["steps"])
-            client_id = new_client_id()
-            prompt_id = await comfy.queue(workflow, client_id)
-            job["prompt_id"] = prompt_id
-            (job["folder"] / "remote.json").write_text(json.dumps({"comfy_name": comfy_name, "prompt_id": prompt_id}))
-            if job["cancel_event"].is_set():
-                await comfy.cancel(prompt_id)
-                return
-
-            def report(data):
-                if data.get("stage"):
-                    job["stage"] = data["stage"]
-                    return
-                if data.get("node") is not None and str(data["node"]) != "11":
-                    return
-                maximum = max(1, int(data.get("max", 1)))
-                value = max(0, min(maximum, int(data.get("value", 0))))
-                job["progress"] = min(99, int(100 * value / maximum))
-                job["stage"] = "generating_video"
-
-            history = await comfy.wait(prompt_id, client_id, report, job["cancel_event"].is_set, JOB_TIMEOUT_SECONDS)
-            if job["cancel_event"].is_set() or history is None:
-                return
-            job["stage"] = "collecting_result"
-            outputs = history.get("outputs", {})
-            job["remote_outputs"] = [item for node in outputs.values() for item in (node.get("images", []) + node.get("gifs", []) + node.get("videos", []) + node.get("files", [])) if item.get("filename")]
-            (job["folder"] / "remote.json").write_text(json.dumps({"comfy_name": comfy_name, "remote_outputs": job["remote_outputs"], "prompt_id": prompt_id}))
-            info = next((item for item in job["remote_outputs"] if item.get("filename", "").lower().endswith(".mp4")), None)
-            if not info:
-                raise RuntimeError("ComfyUI finished without a video output")
-            payload = await comfy.download(info)
-            if job["cancel_event"].is_set():
-                return
-            if not payload:
-                raise RuntimeError("ComfyUI returned an empty video")
-            raw_path = job["folder"] / "comfy-output.mp4"
+            job.update(status="running", stage="loading_image", progress=5)
+            model_frames, output_frames = _frame_counts(job["duration_seconds"])
+            height, width = _video_size(job["image_width"], job["image_height"])
+            raw_path = job["folder"] / "lightwan-output.mp4"
             result_path = job["folder"] / "result.mp4"
-            raw_path.write_bytes(payload)
-            frame_count = 240 if job["duration_seconds"] == 10 else 360
-            command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-protocol_whitelist", "file,pipe", "-i", str(raw_path), "-map", "0:v:0", "-map", "0:a?", "-map_metadata", "-1", "-frames:v", str(frame_count), "-t", str(job["duration_seconds"]), "-vf", "fps=24", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-af", f"atrim=duration={job['duration_seconds']}", "-movflags", "+faststart", str(result_path)]
-            process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-            communicate = asyncio.create_task(process.communicate())
-            cancelled = asyncio.create_task(job["cancel_event"].wait())
-            done, _ = await asyncio.wait({communicate, cancelled}, return_when=asyncio.FIRST_COMPLETED)
-            if cancelled in done and job["cancel_event"].is_set():
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
-                await communicate
+            job.update(stage="generating_video", progress=10, backend_active=True)
+            if not await _wait_or_cancel(
+                runtime.generate(
+                    prompt=job.pop("prompt"), image_path=job["input_path"], output_path=raw_path,
+                    seed=job["seed"], height=height, width=width, model_frames=model_frames,
+                ),
+                cancel_event, JOB_TIMEOUT_SECONDS,
+            ):
                 return
-            cancelled.cancel()
-            await asyncio.gather(cancelled, return_exceptions=True)
-            _, _ = communicate.result()
-            if process.returncode:
-                raise RuntimeError("Video finalization failed")
-            if job["cancel_event"].is_set():
+            job["input_path"].unlink(missing_ok=True)
+            if not raw_path.is_file() or raw_path.stat().st_size == 0:
+                raise RuntimeError("LightX2V finished without a video file")
+            job.update(stage="finalizing_video", progress=90)
+            if not await _wait_or_cancel(
+                _finalize(raw_path, result_path, output_frames), cancel_event, max(0, deadline - time.monotonic()),
+            ):
                 return
             raw_path.unlink(missing_ok=True)
-            job["result_path"] = result_path
-            # Keep the cleanup marker until Comfy's copies and history are gone.
-            _purge_comfy_files(job)
-            if job.get("prompt_id"):
-                try:
-                    await comfy.forget_prompt(job["prompt_id"])
-                except Exception:
-                    pass
-            if job["cancel_event"].is_set():
-                return
-            # The source image and all temporary inputs/intermediates are removed before download is exposed.
-            _cleanup(job, keep_result=True)
-            job.update(status="completed", stage="completed", progress=100, completed_at=time.time(), error=None)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            if not job["cancel_event"].is_set():
-                stopped = True
-                if job.get("prompt_id"):
-                    try:
-                        stopped = await comfy.cancel(job["prompt_id"])
-                    except Exception:
-                        stopped = False
-                if stopped:
-                    if job.get("prompt_id"):
-                        try:
-                            await comfy.forget_prompt(job["prompt_id"])
-                        except Exception:
-                            pass
-                    _purge_comfy_files(job)
-                    _cleanup(job)
-                else:
-                    job["remote_cleanup_pending"] = True
+            job.update(
+                status="completed", stage="completed", progress=100, result_path=result_path,
+                completed_at=time.time(), error=None,
+            )
+        except TimeoutError:
+            job.update(status="failed", stage="failed", progress=None, error="Video generation timed out.", completed_at=time.time())
+        except Exception:
+            if not cancel_event.is_set():
                 job.update(status="failed", stage="failed", progress=None, error="Video generation failed. Please try again.", completed_at=time.time())
         finally:
-            if job["cancel_event"].is_set():
-                stopped = True
-                if job.get("prompt_id"):
-                    try:
-                        stopped = await comfy.cancel(job["prompt_id"])
-                    except Exception:
-                        stopped = False
-                if stopped:
-                    if job.get("prompt_id"):
-                        try:
-                            await comfy.forget_prompt(job["prompt_id"])
-                        except Exception:
-                            pass
-                    _purge_comfy_files(job)
-                    _cleanup(job)
+            job["backend_active"] = False
+            if job["status"] != "completed":
+                _cleanup(job)
             queue.task_done()
 
 
-async def _worker():
+async def _worker() -> None:
     while True:
-        job_id = await queue.get()
-        await _run_job(job_id)
+        await _run_job(await queue.get())
+        while not runtime.ready:
+            try:
+                await runtime.load()
+            except Exception:
+                print("LightWan runtime recovery failed; retrying", flush=True)
+                await asyncio.sleep(10)
 
 
-async def _reaper():
+async def _reaper() -> None:
     while True:
-        # Bounded sweep keeps terminal media cleanup within one second of expiry.
         await asyncio.sleep(1)
         now = time.time()
         for job in list(jobs.values()):
-            if job["status"] not in {"completed", "failed", "cancelled", "expired"}:
-                continue
-            if job.get("remote_cleanup_pending") and job.get("prompt_id"):
-                try:
-                    if not await comfy.cancel(job["prompt_id"]):
-                        continue
-                    await comfy.forget_prompt(job["prompt_id"])
-                except Exception:
-                    continue
-                _purge_comfy_files(job)
+            if not job.get("backend_active") and job.get("status") in {"completed", "failed", "cancelled", "expired"} and now - job.get("completed_at", job["created_at"]) >= RETENTION_SECONDS:
                 _cleanup(job)
-                job["remote_cleanup_pending"] = False
-            if now - job.get("completed_at", job["created_at"]) >= RETENTION_SECONDS:
-                if job["status"] == "cancelled" and job.get("prompt_id"):
-                    try:
-                        if not await comfy.cancel(job["prompt_id"]):
-                            continue
-                    except Exception:
-                        continue
-                _purge_comfy_files(job)
-                if job.get("prompt_id"):
-                    try:
-                        await comfy.forget_prompt(job["prompt_id"])
-                    except Exception:
-                        pass
-                _cleanup(job)
-                job.update(status="expired", stage="expired", progress=None, result_path=None, error=None)
+                job.update(status="expired", stage="expired", progress=None, error=None)
 
 
 @app.on_event("startup")
-async def startup():
+async def startup() -> None:
     if not DATA_ROOT.resolve().is_relative_to(Path("/tmp").resolve()):
         raise RuntimeError("Job storage must stay under /tmp")
     DATA_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     DATA_ROOT.chmod(0o700)
-    # No job survives restart. Remove old ephemeral files and begin with a clean queue.
     for child in DATA_ROOT.iterdir():
         if child.is_dir():
-            marker = child / "remote.json"
-            if marker.is_file():
-                try:
-                    prior = json.loads(marker.read_text())
-                    if prior.get("prompt_id"):
-                        if not await comfy.cancel(prior["prompt_id"]):
-                            raise RuntimeError("ComfyUI job is still active")
-                        await comfy.forget_prompt(prior["prompt_id"])
-                    _purge_comfy_files({"id": child.name, "comfy_name": prior.get("comfy_name"), "remote_outputs": prior.get("remote_outputs", [])})
-                except Exception:
-                    raise RuntimeError("Could not safely clean a previous job") from None
             shutil.rmtree(child, ignore_errors=True)
         else:
             child.unlink(missing_ok=True)
+    if not TOKEN:
+        raise RuntimeError("Configure IMAGINE_VIDEO_TOKEN")
+    await runtime.load()
+    print("LightWan runtime ready", flush=True)
     global worker_task, reaper_task
     worker_task = asyncio.create_task(_worker())
     reaper_task = asyncio.create_task(_reaper())
 
 
 @app.on_event("shutdown")
-async def shutdown():
+async def shutdown() -> None:
     for task in (worker_task, reaper_task):
         if task:
             task.cancel()
-    if worker_task and worker_task.done() is False:
-        await asyncio.gather(worker_task, return_exceptions=True)
-    if reaper_task and reaper_task.done() is False:
-        await asyncio.gather(reaper_task, return_exceptions=True)
+    await asyncio.gather(*(task for task in (worker_task, reaper_task) if task), return_exceptions=True)
+    await runtime.close()
     for job in jobs.values():
-        stopped = True
-        if job.get("prompt_id"):
-            try:
-                stopped = await comfy.cancel(job["prompt_id"])
-            except Exception:
-                stopped = False
-        if stopped:
-            if job.get("prompt_id"):
-                try:
-                    await comfy.forget_prompt(job["prompt_id"])
-                except Exception:
-                    pass
-            _purge_comfy_files(job)
-            _cleanup(job)
-    await comfy.close()
+        _cleanup(job)
 
 
 @app.get("/v1/health")
 async def health(authorization: str | None = Header(None)):
     _authorized(authorization)
-    models = (
-        "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-        "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-        "vae/minimax_h3_video_vae_int8_convrot.safetensors",
-        "vae/minimax_h3_audio_vae_fp32.safetensors",
-    )
-    if any(not (COMFY_ROOT / "models" / relative).is_file() for relative in models):
+    if not runtime.ready:
         raise HTTPException(503, "Worker is not ready")
-    try:
-        available_nodes = await comfy.health()
-    except Exception:
-        raise HTTPException(503, "Worker is not ready") from None
-    turbo_file = COMFY_ROOT / "models" / "loras" / TURBO_LORA
-    turbo_available = turbo_file.is_file() and "LoraLoaderModelOnly" in available_nodes
-    return {"status": "ok", "supported_steps": [8, 12, 20], "supported_modes": ["base", "turbo"] if turbo_available else ["base"]}
+    return {
+        "status": "ok",
+        "model": "LightWan2.2-A14B I2V",
+        "runtime": "LightX2V 0.6.0",
+        "precision": "NVFP4",
+        "actual_steps": 4,
+        "supported_steps": [8],
+        "supported_modes": ["turbo"],
+        "wire_compatibility": {"mode": "turbo", "steps": 8, "actual_model_steps": 4},
+        "attention": {"self": "dynamic_sparse_attn (sage2, 90% sparsity)", "cross": "sage_attn2"},
+        "resolution": "approximately 720p, aspect-preserving",
+        "fps": FPS,
+        "supported_durations_seconds": [10, 15] if LONG_VIDEO_ENABLED else [],
+        "experimental_long_video": LONG_VIDEO_ENABLED,
+        "gpu": runtime.device_name,
+    }
 
 
 @app.post("/v1/jobs")
-async def create_job(file: UploadFile = File(...), prompt: str = Form(...), duration_seconds: int = Form(...), steps: int | None = Form(None), mode: str = Form("base"), authorization: str | None = Header(None), idempotency_key: str | None = Header(None, alias="Idempotency-Key")):
+async def create_job(
+    file: UploadFile = File(...), prompt: str = Form(...), duration_seconds: int = Form(...),
+    steps: int | None = Form(None), mode: str = Form("turbo"), authorization: str | None = Header(None),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
     _authorized(authorization)
+    if not LONG_VIDEO_ENABLED:
+        raise HTTPException(422, "LightWan 10/15-second output is experimental; enable IMAGINE_LIGHTWAN_ENABLE_LONG_VIDEO=1")
     if duration_seconds not in (10, 15):
         raise HTTPException(422, "duration_seconds must be 10 or 15")
-    if mode not in {"base", "turbo"}:
-        raise HTTPException(422, "mode must be base or turbo")
-    if mode == "turbo":
-        if steps not in (None, 8):
-            raise HTTPException(422, "Turbo mode requires 8 steps")
-        if not (COMFY_ROOT / "models" / "loras" / TURBO_LORA).is_file():
-            raise HTTPException(503, "Turbo mode is unavailable because its 8-step LoRA is not installed")
-        try:
-            available_nodes = await comfy.health()
-        except Exception:
-            raise HTTPException(503, "ComfyUI is not ready") from None
-        if "LoraLoaderModelOnly" not in available_nodes:
-            raise HTTPException(503, "Turbo mode is unavailable because ComfyUI lacks LoraLoaderModelOnly")
-        selected_steps = 8
-    else:
-        try:
-            selected_steps = sampling_steps(steps)
-        except ValueError as exc:
-            raise HTTPException(422, "steps must be 8, 12, or 20") from exc
+    if mode != "turbo":
+        raise HTTPException(422, "LightWan uses the turbo wire compatibility mode")
+    if steps not in (None, 8):
+        raise HTTPException(422, "LightWan uses the 8-step turbo compatibility value")
+    if not runtime.ready:
+        raise HTTPException(503, "LightWan runtime is not ready")
     prompt = prompt.strip()
     if not prompt or len(prompt) > 2000:
         raise HTTPException(422, "Prompt must contain 1 to 2000 characters")
@@ -442,20 +318,24 @@ async def create_job(file: UploadFile = File(...), prompt: str = Form(...), dura
     folder = DATA_ROOT / job_id
     try:
         folder.mkdir(mode=0o700, parents=True)
-        input_path = folder / "input.upload"
-        _, digest, image_format, image_width, image_height = await _bytes_to_file(file, input_path)
-    except Exception:
+        suffix = Path(file.filename or "input.jpg").suffix.lower()
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            suffix = ".upload"
+        input_path = folder / ("input" + suffix)
+        image_width, image_height = await _store_upload(file, input_path)
+    except BaseException:
         shutil.rmtree(folder, ignore_errors=True)
         raise
     finally:
         async with admission_lock:
             admission_reserved = False
-    suffix = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}[image_format]
-    if input_path.suffix != suffix:
-        renamed = folder / ("input" + suffix)
-        input_path.rename(renamed)
-        input_path = renamed
-    job = {"id": job_id, "status": "queued", "stage": "queued", "progress": 0, "error": None, "prompt": prompt, "duration_seconds": duration_seconds, "steps": selected_steps, "mode": mode, "folder": folder, "input_path": input_path, "created_at": time.time(), "input_sha256": digest, "seed": int.from_bytes(os.urandom(8), "big"), "image_width": image_width, "image_height": image_height, "cancel_event": asyncio.Event()}
+    job = {
+        "id": job_id, "status": "queued", "stage": "queued", "progress": 0,
+        "error": None, "prompt": prompt, "duration_seconds": duration_seconds,
+        "steps": 8, "model_steps": 4, "mode": "turbo", "folder": folder,
+        "input_path": input_path, "created_at": time.time(), "seed": int.from_bytes(os.urandom(8), "big"),
+        "image_width": image_width, "image_height": image_height, "cancel_event": asyncio.Event(),
+    }
     jobs[job_id] = job
     if idempotency_key:
         idempotency[idempotency_key] = job_id
@@ -463,18 +343,17 @@ async def create_job(file: UploadFile = File(...), prompt: str = Form(...), dura
     return JSONResponse(_snapshot(job), status_code=202)
 
 
-def _get_job(job_id: str) -> dict:
+def _get_job(job_id: str) -> dict[str, Any]:
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     return job
 
 
-def _expire_if_due(job: dict[str, Any]):
-    completed_at = job.get("completed_at")
-    if job["status"] == "completed" and completed_at is not None and time.time() >= completed_at + RETENTION_SECONDS:
+def _expire_if_due(job: dict[str, Any]) -> None:
+    if job["status"] == "completed" and time.time() >= job.get("completed_at", time.time()) + RETENTION_SECONDS:
         _cleanup(job)
-        job.update(status="expired", stage="expired", progress=None, result_path=None, error=None)
+        job.update(status="expired", stage="expired", progress=None, error=None)
 
 
 @app.get("/v1/jobs/{job_id}")
@@ -490,31 +369,22 @@ async def get_result(job_id: str, authorization: str | None = Header(None)):
     _authorized(authorization)
     job = _get_job(job_id)
     _expire_if_due(job)
-    if job["status"] != "completed" or not job.get("result_path") or not job["result_path"].is_file():
+    path = job.get("result_path")
+    if job["status"] != "completed" or not path or not path.is_file():
         raise HTTPException(410 if job["status"] == "expired" else 409, "Job result is not available")
-    return FileResponse(job["result_path"], media_type="video/mp4", filename=f"imagine-{job_id}.mp4", headers={"Cache-Control": "no-store"})
+    return FileResponse(path, media_type="video/mp4", filename=f"imagine-{job_id}.mp4", headers={"Cache-Control": "no-store"})
 
 
 @app.post("/v1/jobs/{job_id}/ack", status_code=204)
 async def ack_job(job_id: str, authorization: str | None = Header(None)):
     _authorized(authorization)
     job = _get_job(job_id)
-    _expire_if_due(job)
     if job["status"] in {"queued", "running"}:
         raise HTTPException(409, "Cannot acknowledge a job while it is running")
-    if job.get("remote_cleanup_pending") and job.get("prompt_id"):
-        try:
-            if not await comfy.cancel(job["prompt_id"]):
-                raise HTTPException(409, "Job cleanup is still in progress")
-        except HTTPException:
-            raise
-        except Exception:
-            raise HTTPException(409, "Job cleanup is still in progress") from None
-        job["remote_cleanup_pending"] = False
-        await comfy.forget_prompt(job["prompt_id"])
-        _purge_comfy_files(job)
+    if job.get("backend_active"):
+        raise HTTPException(409, "Job cleanup is still in progress")
     _cleanup(job)
-    job.update(status="expired", stage="expired", progress=None, result_path=None, error=None)
+    job.update(status="expired", stage="expired", progress=None, error=None)
     return Response(status_code=204)
 
 
@@ -523,34 +393,15 @@ async def delete_job(job_id: str, authorization: str | None = Header(None)):
     _authorized(authorization)
     job = _get_job(job_id)
     if job["status"] in {"queued", "running"}:
-        was_running = job["status"] == "running"
+        was_queued = job["status"] == "queued"
         job["cancel_event"].set()
         job.update(status="cancelled", stage="cancelled", progress=None, completed_at=time.time())
-        if was_running and job.get("prompt_id"):
-            try:
-                await comfy.cancel(job["prompt_id"])
-            except Exception:
-                pass
-        if was_running:
-            return _snapshot(job)
-        _purge_comfy_files(job)
-        _cleanup(job)
+        if was_queued:
+            _cleanup(job)
         return _snapshot(job)
-    if job.get("remote_cleanup_pending") and job.get("prompt_id"):
-        try:
-            if not await comfy.cancel(job["prompt_id"]):
-                return _snapshot(job)
-            await comfy.forget_prompt(job["prompt_id"])
-        except Exception:
-            return _snapshot(job)
-        job["remote_cleanup_pending"] = False
-    _purge_comfy_files(job)
-    if job.get("prompt_id"):
-        try:
-            await comfy.forget_prompt(job["prompt_id"])
-        except Exception:
-            pass
+    if job.get("backend_active"):
+        return _snapshot(job)
     _cleanup(job)
     if job["status"] != "cancelled":
-        job.update(status="expired", stage="expired", progress=None, result_path=None, error=None)
+        job.update(status="expired", stage="expired", progress=None, error=None)
     return _snapshot(job)

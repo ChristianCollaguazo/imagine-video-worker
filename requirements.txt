@@ -1,6 +1,7 @@
-fastapi
-uvicorn[standard]
-python-multipart
-Pillow
-httpx
-websockets
+# The immutable upstream base provides Python, Torch, FFmpeg and the bulk of
+# LightX2V's dependencies. Install only the worker and Wan import requirements
+# not guaranteed by that image.
+python-multipart==0.0.20
+gguf==0.17.1
+prometheus-client==0.22.1
+sentencepiece==0.2.1

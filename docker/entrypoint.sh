@@ -3,26 +3,18 @@ set -euo pipefail
 cd /opt/imagine-video-worker
 : "${IMAGINE_VIDEO_TOKEN:?Configure IMAGINE_VIDEO_TOKEN in RunPod Secrets}"
 export IMAGINE_VIDEO_TOKEN
-export IMAGINE_VIDEO_RUN_ROOT=/tmp/imagine-video-worker
-# Fail fast on incompatible GPU before copying large weights.
-.venv-comfy/bin/python -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable"; assert torch.cuda.is_bf16_supported(), "BF16 unavailable"; print(torch.cuda.get_device_name(0), flush=True)'
-.venv-comfy/bin/python docker/stage_models.py
-cleanup() {
-  bash scripts/stop.sh || true
-}
-trap cleanup EXIT
-trap 'exit 143' TERM
-trap 'exit 130' INT
-bash scripts/start.sh
-# The original start.sh backgrounds both services; keep container alive and
-# exit if either process disappears. Tini reaps orphaned child processes.
-while true; do
-  for service in comfyui worker; do
-    pid=$(cat "$IMAGINE_VIDEO_RUN_ROOT/pids/$service.pid")
-    if ! kill -0 "$pid" 2>/dev/null || [[ $(ps -p "$pid" -o stat=) == Z* ]]; then
-      echo "$service exited; stopping container" >&2
-      exit 1
-    fi
-  done
-  sleep 3 & wait $!
-done
+export IMAGINE_VIDEO_DATA=/tmp/imagine-video-worker/jobs
+
+# Runtime and GPU checks happen at deployment, never during the amd64 image build.
+python - <<'PY'
+import torch
+
+assert torch.cuda.is_available(), "CUDA is unavailable to PyTorch"
+assert torch.cuda.is_bf16_supported(), "GPU does not report BF16 support"
+capability = torch.cuda.get_device_capability(0)
+assert capability == (12, 0), f"This NVFP4 LightWan build targets SM120, got compute capability {capability}"
+print(f"LightWan GPU: {torch.cuda.get_device_name(0)}; compute capability {capability}; PyTorch {torch.__version__}", flush=True)
+PY
+
+python docker/stage_models.py
+exec bash scripts/start.sh

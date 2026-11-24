@@ -1,16 +1,28 @@
-"""Fail fast if a manifest model file is missing; download script checks hashes."""
+"""Check the local staged LightWan model stack against the manifest."""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 manifest = json.loads((root / "config/model-manifest.json").read_text())
-# Base and Turbo share these required quantized models. Optional LoRAs do not
-# block worker startup; Turbo capability is reported only when its file/node exist.
-missing = [
-    item["name"] for item in manifest["models"]
-    if not (root / "ComfyUI/models" / item["path"]).is_file()
-]
-if missing:
-    raise SystemExit("Missing model files: " + ", ".join(missing))
+model_root = Path(os.environ.get("LIGHTWAN_MODEL_DIR", "/opt/imagine/models/Wan2.2-I2V-A14B"))
+missing: list[str] = []
+invalid: list[str] = []
+for item in manifest["models"]:
+    path = model_root / item["path"]
+    if not path.is_file():
+        missing.append(item["path"])
+    else:
+        with path.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != item["sha256"]:
+                invalid.append(item["path"])
+if missing or invalid:
+    if missing:
+        print("Missing files: " + ", ".join(missing))
+    if invalid:
+        print("SHA-256 mismatch: " + ", ".join(invalid))
+    raise SystemExit(1)
+print(f"Verified {len(manifest['models'])} LightWan model files")

@@ -1,73 +1,104 @@
 {
   "schema_version": 1,
-  "source": "https://huggingface.co/Comfy-Org/MiniMax-H3",
-  "revision": "3f57e8291d2ef846f9a074b1b76d2767db434abe",
-  "license": "minimax-h3-community-license-agreement",
+  "model": "LightWan2.2-A14B I2V NVFP4",
+  "license": "apache-2.0",
+  "runtime": {
+    "repository": "https://github.com/ModelTC/LightX2V.git",
+    "revision": "94f0f19459e66f61a723db7690f1707f308599ef",
+    "release": "0.6.0"
+  },
+  "model_root": "Wan2.2-I2V-A14B",
   "models": [
     {
-      "id": "fl2va_model",
-      "name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-      "path": "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-      "role": "FL2VA pruned INT8 ConvRot diffusion model",
-      "repo": "Comfy-Org/MiniMax-H3",
-      "revision": "3f57e8291d2ef846f9a074b1b76d2767db434abe",
-      "sha256": "e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a",
-      "bytes_approx": 21000000000
+      "id": "high_noise_nvfp4",
+      "repo": "lightx2v/LightWan2.2-A14B",
+      "revision": "a6f09bcd5ffbd079e7397cb7c185691a13445af7",
+      "name": "high_nvfp4.safetensors",
+      "path": "high_nvfp4.safetensors",
+      "role": "LightWan I2V high-noise NVFP4 distilled DiT expert",
+      "bytes": 8379014392,
+      "sha256": "1da94b1604f4bb181d1319f311245e39e33e499b3a0a5bf2fafb117b08750ac7"
     },
     {
-      "id": "text_encoder",
-      "name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-      "path": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-      "role": "Qwen3VL NVFP4-AWQ text and image encoder",
-      "repo": "Comfy-Org/MiniMax-H3",
-      "revision": "3f57e8291d2ef846f9a074b1b76d2767db434abe",
-      "sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6",
-      "bytes_approx": 15687142551
+      "id": "low_noise_nvfp4",
+      "repo": "lightx2v/LightWan2.2-A14B",
+      "revision": "a6f09bcd5ffbd079e7397cb7c185691a13445af7",
+      "name": "low_nvfp4.safetensors",
+      "path": "low_nvfp4.safetensors",
+      "role": "LightWan I2V low-noise NVFP4 distilled DiT expert",
+      "bytes": 8379014392,
+      "sha256": "9feda8a7f4791c6e4f0dd8ab383fa67d429441dfb006b97a1e3b5400e74bc232"
     },
     {
-      "id": "video_vae",
-      "name": "minimax_h3_video_vae_int8_convrot.safetensors",
-      "path": "vae/minimax_h3_video_vae_int8_convrot.safetensors",
-      "role": "video VAE INT8 ConvRot",
-      "repo": "Comfy-Org/MiniMax-H3",
-      "revision": "7cc7389563624200249315b8fc37d3d6c943d846",
-      "sha256": "52a2c8c73583c86e4f41cdcce3a6ad0ea562987bc0bf3d60a0cef5f5c8e60c0e",
-      "bytes_approx": 2810000000
+      "id": "i2v_model_config",
+      "repo": "Wan-AI/Wan2.2-I2V-A14B",
+      "revision": "206a9ee1b7bfaaf8f7e4d81335650533490646a3",
+      "name": "low_noise_model/config.json",
+      "path": "low_noise_model/config.json",
+      "role": "Wan2.2 I2V architecture metadata required by LightX2V",
+      "bytes": 250,
+      "sha256": "481cf6e035b2aa9c442512ca08cc69a8d371799dc4d1626426ab8714e78add47"
     },
     {
-      "id": "audio_vae",
-      "name": "minimax_h3_audio_vae_fp32.safetensors",
-      "path": "vae/minimax_h3_audio_vae_fp32.safetensors",
-      "role": "audio VAE FP32",
-      "repo": "Comfy-Org/MiniMax-H3",
-      "revision": "3f57e8291d2ef846f9a074b1b76d2767db434abe",
-      "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
-      "bytes_approx": 605000000
+      "id": "t5_encoder",
+      "repo": "Wan-AI/Wan2.2-I2V-A14B",
+      "revision": "206a9ee1b7bfaaf8f7e4d81335650533490646a3",
+      "name": "models_t5_umt5-xxl-enc-bf16.pth",
+      "path": "models_t5_umt5-xxl-enc-bf16.pth",
+      "role": "UMT5-XXL BF16 text encoder",
+      "bytes": 11361920418,
+      "sha256": "7cace0da2b446bbbbc57d031ab6cf163a3d59b366da94e5afe36745b746fd81d"
+    },
+    {
+      "id": "wan_vae",
+      "repo": "Wan-AI/Wan2.2-I2V-A14B",
+      "revision": "206a9ee1b7bfaaf8f7e4d81335650533490646a3",
+      "name": "Wan2.1_VAE.pth",
+      "path": "Wan2.1_VAE.pth",
+      "role": "Wan video VAE used by the I2V config",
+      "bytes": 507609880,
+      "sha256": "38071ab59bd94681c686fa51d75a1968f64e470262043be31f7a094e442fd981"
+    },
+    {
+      "id": "t5_tokenizer_json",
+      "repo": "Wan-AI/Wan2.2-I2V-A14B",
+      "revision": "206a9ee1b7bfaaf8f7e4d81335650533490646a3",
+      "name": "google/umt5-xxl/tokenizer.json",
+      "path": "google/umt5-xxl/tokenizer.json",
+      "role": "UMT5 tokenizer JSON",
+      "bytes": 16837417,
+      "sha256": "6e197b4d3dbd71da14b4eb255f4fa91c9c1f2068b20a2de2472967ca3d22602b"
+    },
+    {
+      "id": "t5_tokenizer_spiece",
+      "repo": "Wan-AI/Wan2.2-I2V-A14B",
+      "revision": "206a9ee1b7bfaaf8f7e4d81335650533490646a3",
+      "name": "google/umt5-xxl/spiece.model",
+      "path": "google/umt5-xxl/spiece.model",
+      "role": "UMT5 SentencePiece vocabulary",
+      "bytes": 4548313,
+      "sha256": "e3909a67b780650b35cf529ac782ad2b6b26e6d1f849d3fbb6a872905f452458"
+    },
+    {
+      "id": "t5_tokenizer_config",
+      "repo": "Wan-AI/Wan2.2-I2V-A14B",
+      "revision": "206a9ee1b7bfaaf8f7e4d81335650533490646a3",
+      "name": "google/umt5-xxl/tokenizer_config.json",
+      "path": "google/umt5-xxl/tokenizer_config.json",
+      "role": "UMT5 tokenizer metadata",
+      "bytes": 61728,
+      "sha256": "ed9a3a8b0faa71a70a32847e0435fe036e6e112d4df4edb7bb48a921e344dc05"
+    },
+    {
+      "id": "t5_special_tokens",
+      "repo": "Wan-AI/Wan2.2-I2V-A14B",
+      "revision": "206a9ee1b7bfaaf8f7e4d81335650533490646a3",
+      "name": "google/umt5-xxl/special_tokens_map.json",
+      "path": "google/umt5-xxl/special_tokens_map.json",
+      "role": "UMT5 special token metadata",
+      "bytes": 6623,
+      "sha256": "7b8a9f5040adb67b5805abdfd42c1f8d0f3d0e711f10726580eb3789cd0ad61d"
     }
   ],
-  "optional_models": [
-    {
-      "id": "fl2v_turbo_lora_8step",
-      "name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-      "path": "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-      "role": "Optional 8-step Lightning LoRA for experimental H3 I2V Turbo mode",
-      "repo": "Comfy-Org/MiniMax-H3",
-      "revision": "186455f4c2a878eb57d5c7916c5b0f71a77e8ceb",
-      "sha256": "2339acdf19bfe123f46b971ea35d367a84adb85de43627e1eceafa5a5b2b111e",
-      "bytes_approx": 1960000000
-    }
-  ],
-  "comfyui": {
-    "repository": "https://github.com/Comfy-Org/ComfyUI.git",
-    "ref": "v0.34.0",
-    "reason": "First pinned stable ComfyUI release after built-in MiniMax H3 native workflow nodes landed"
-  },
-  "runtime": {
-    "python": "3.12",
-    "torch": "2.11.0",
-    "torchvision": "0.26.0",
-    "torchaudio": "2.11.0",
-    "cuda_wheel": "cu130",
-    "torch_index_url": "https://download.pytorch.org/whl/cu130"
-  }
+  "download_bytes": 28649013413
 }
