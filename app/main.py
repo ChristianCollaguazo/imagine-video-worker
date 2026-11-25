@@ -8,6 +8,7 @@ import json
 import math
 import os
 import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -40,6 +41,7 @@ COMFY_OUTPUT_DIR = Path(os.environ.get("COMFY_OUTPUT_DIR", str(COMFY_ROOT / "out
 COMFY_TEMP_DIR = Path(os.environ.get("COMFY_TEMP_DIR", str(COMFY_ROOT / "temp")))
 DATA_ROOT = Path(os.environ.get("IMAGINE_VIDEO_DATA", "/tmp/imagine-video-worker"))
 MAX_UPLOAD_BYTES = int(os.environ.get("IMAGINE_VIDEO_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+MAX_LORA_UPLOAD_BYTES = int(os.environ.get("IMAGINE_VIDEO_MAX_LORA_UPLOAD_BYTES", str(4 * 1024 * 1024 * 1024)))
 JOB_TIMEOUT_SECONDS = max(60, int(os.environ.get("IMAGINE_VIDEO_JOB_TIMEOUT_SECONDS", str(90 * 60))))
 MAX_PIXELS = 40_000_000
 RETENTION_SECONDS = 15 * 60
@@ -164,6 +166,45 @@ async def _bytes_to_file(upload: UploadFile, target: Path) -> tuple[int, str, st
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
         raise HTTPException(415, "Uploaded file is not a supported image") from None
     return total, digest.hexdigest(), image_format, image_width, image_height
+
+
+def _safe_lora_filename(filename: str | None) -> str:
+    if (not filename or len(filename) > 255 or filename.startswith(".")
+            or Path(filename).name != filename or "/" in filename or "\\" in filename
+            or "\x00" in filename or not filename.endswith(".safetensors")):
+        raise HTTPException(422, "Upload a LoRA with a .safetensors basename")
+    return filename
+
+
+async def _store_lora(upload: UploadFile, filename: str) -> int:
+    """Stream a LoRA to a same-directory temporary file, then link it without clobbering."""
+    root = COMFY_ROOT / "models" / "loras"
+    if not root.is_dir():
+        raise HTTPException(503, "LoRA storage is not available")
+    target = root / filename
+    temp_path: Path | None = None
+    total = 0
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=".imagine-upload-", suffix=".part", dir=root)
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "wb") as output:
+            while chunk := await upload.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_LORA_UPLOAD_BYTES:
+                    raise HTTPException(413, "LoRA exceeds the upload limit")
+                output.write(chunk)
+            if not total:
+                raise HTTPException(422, "LoRA file is empty")
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temp_path, target)
+        except FileExistsError:
+            raise HTTPException(409, "A LoRA with that filename already exists") from None
+        return total
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _remove_owned_file(root: Path | None, relative: str):
@@ -591,6 +632,17 @@ async def list_loras(authorization: str | None = Header(None)):
         "loras": [{"name": name, "available": True, "default_strength": 1.0} for name in names],
         "default_lora": TURBO_LORA if TURBO_LORA in names else None,
     }
+
+
+@app.post("/v1/loras", status_code=201)
+async def upload_lora(file: UploadFile = File(...), authorization: str | None = Header(None)):
+    _authorized(authorization)
+    filename = _safe_lora_filename(file.filename)
+    try:
+        size = await _store_lora(file, filename)
+    finally:
+        await file.close()
+    return {"name": filename, "size": size}
 
 
 @app.post("/v1/jobs")
