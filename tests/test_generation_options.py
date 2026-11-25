@@ -6,8 +6,12 @@ from unittest.mock import patch
 from app.lora_catalog import available_lora_names, resolve_lora_name, resolve_lora_stack
 from app.workflow import (
     FIRST_BLOCK_CACHE_NODE,
+    FIRST_BLOCK_CACHE_FAST_PRESET,
     FIRST_BLOCK_CACHE_SAFE_PRESET,
+    DEFAULT_RESOLUTION,
+    DEFAULT_STEPS,
     build_workflow,
+    build_turbo_workflow,
     canvas_for_image,
     first_block_cache_mode,
     sampling_steps,
@@ -16,6 +20,8 @@ from app.workflow import (
 
 class GenerationOptionsTests(unittest.TestCase):
     def test_steps_accept_one_through_fifty_including_four(self):
+        self.assertEqual(DEFAULT_STEPS, 16)
+        self.assertEqual(sampling_steps(), 16)
         for value in (1, 4, 8, 12, 20, 50):
             self.assertEqual(sampling_steps(value), value)
         for value in (0, 51, -1):
@@ -23,7 +29,7 @@ class GenerationOptionsTests(unittest.TestCase):
                 sampling_steps(value)
 
     def test_supported_resolutions_are_short_edge_targets(self):
-        for resolution in (480, 576, 768):
+        for resolution in (480, 576, 672, 768):
             width, height = canvas_for_image(1600, 900, resolution)
             self.assertEqual(width % 32, 0)
             self.assertEqual(height % 32, 0)
@@ -52,9 +58,20 @@ class GenerationOptionsTests(unittest.TestCase):
         self.assertEqual(workflow["16"]["inputs"]["strength_model"], 0.65)
         self.assertNotIn("13", workflow)
 
-    def test_first_block_cache_defaults_to_safe_and_can_be_disabled_explicitly(self):
+    def test_h3_defaults_and_first_block_cache_modes(self):
+        self.assertEqual(DEFAULT_RESOLUTION, 672)
+        self.assertEqual(build_workflow("walk", "input.png", 5, 4)["7"]["inputs"]["steps"], 16)
+        self.assertEqual(build_turbo_workflow("walk", "input.png", 5, 4)["7"]["inputs"]["steps"], 16)
+        self.assertEqual(build_workflow("walk", "input.png", 5, 4, steps=7)["7"]["inputs"]["steps"], 7)
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(first_block_cache_mode(), "safe")
+        safe_default = build_workflow("walk", "input.png", 5, 4)
+        self.assertEqual(safe_default["16"]["inputs"]["mode"], FIRST_BLOCK_CACHE_SAFE_PRESET)
+        fast = build_workflow("walk", "input.png", 5, 4, first_block_cache="fast")
+        self.assertEqual(fast["16"]["class_type"], FIRST_BLOCK_CACHE_NODE)
+        self.assertEqual(fast["16"]["inputs"]["mode"], FIRST_BLOCK_CACHE_FAST_PRESET)
+        self.assertEqual(fast["16"]["inputs"]["threshold"], 0.10)
+
         workflow = build_workflow("walk", "input.png", 5, 4, first_block_cache="safe")
         self.assertEqual(workflow["16"]["class_type"], FIRST_BLOCK_CACHE_NODE)
         self.assertEqual(workflow["16"]["inputs"]["mode"], FIRST_BLOCK_CACHE_SAFE_PRESET)
@@ -77,8 +94,10 @@ class GenerationOptionsTests(unittest.TestCase):
         self.assertEqual(workflow["17"]["inputs"]["model"], ["16", 0])
         self.assertEqual(workflow["7"]["inputs"]["model"], ["17", 0])
         self.assertEqual(workflow["10"]["inputs"]["model"], ["17", 0])
-        with self.assertRaises(ValueError):
-            first_block_cache_mode("fast")
+        with patch.dict("os.environ", {"IMAGINE_VIDEO_FIRST_BLOCK_CACHE": "safe"}):
+            self.assertEqual(first_block_cache_mode(), "safe")
+        with patch.dict("os.environ", {"IMAGINE_VIDEO_FIRST_BLOCK_CACHE": "off"}):
+            self.assertEqual(first_block_cache_mode(), "off")
 
     def test_lora_catalog_is_rescanned_and_only_returns_basenames(self):
         with TemporaryDirectory() as directory:

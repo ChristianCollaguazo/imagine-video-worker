@@ -21,9 +21,10 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from .comfy import ComfyClient, ModelLoaderError, new_client_id
 from .lora_catalog import available_lora_names, resolve_lora_name, resolve_lora_stack
 from .workflow import (
+    DEFAULT_STEPS,
     DEFAULT_RESOLUTION,
     FIRST_BLOCK_CACHE_NODE,
-    FIRST_BLOCK_CACHE_SAFE_PRESET,
+    FIRST_BLOCK_CACHE_PRESETS,
     SUPPORTED_DURATIONS,
     SUPPORTED_RESOLUTIONS,
     VIDEO_FPS,
@@ -284,7 +285,7 @@ async def _run_job(job_id: str):
             effective_width=job["effective_width"], effective_height=job["effective_height"],
             lora_name=job.get("lora_name"), lora_strength=job["lora_strength"], lora_stack=job["lora_stack"],
             first_block_cache_mode=FIRST_BLOCK_CACHE_MODE,
-            first_block_cache_preset=FIRST_BLOCK_CACHE_SAFE_PRESET if FIRST_BLOCK_CACHE_MODE == "safe" else None,
+            first_block_cache_preset=FIRST_BLOCK_CACHE_PRESETS.get(FIRST_BLOCK_CACHE_MODE),
         )
         job["status"], job["stage"], job["progress"] = "running", "uploading_photo", None
         try:
@@ -311,7 +312,7 @@ async def _run_job(job_id: str):
             )
             for index in range(len(job["lora_stack"])):
                 node_labels[str(16 + index)] = f"lora_loader_{index + 1}"
-            if FIRST_BLOCK_CACHE_MODE == "safe":
+            if FIRST_BLOCK_CACHE_MODE != "off":
                 node_labels[str(16 + len(job["lora_stack"]))] = "first_block_cache"
             job.pop("prompt", None)
             client_id = new_client_id()
@@ -577,7 +578,7 @@ async def startup():
         vram_profile=VRAM_PROFILE, audio=AUDIO,
         attention_backend_selected=ATTENTION_BACKEND_SELECTED,
         first_block_cache_mode=FIRST_BLOCK_CACHE_MODE,
-        first_block_cache_preset=FIRST_BLOCK_CACHE_SAFE_PRESET if FIRST_BLOCK_CACHE_MODE == "safe" else None,
+        first_block_cache_preset=FIRST_BLOCK_CACHE_PRESETS.get(FIRST_BLOCK_CACHE_MODE),
     )
 
 
@@ -623,7 +624,7 @@ async def health(authorization: str | None = Header(None)):
         available_nodes = await comfy.health()
     except Exception:
         raise HTTPException(503, "Worker is not ready") from None
-    if FIRST_BLOCK_CACHE_MODE == "safe" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
+    if FIRST_BLOCK_CACHE_MODE != "off" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
         raise HTTPException(503, "ComfyUI FirstBlockCache node is missing; install the pinned custom node or set IMAGINE_VIDEO_FIRST_BLOCK_CACHE=off")
     lora_names = _available_lora_names() if "LoraLoaderModelOnly" in available_nodes else []
     turbo_available = TURBO_LORA in lora_names
@@ -635,7 +636,7 @@ async def health(authorization: str | None = Header(None)):
         "attention_policy": "Selected at worker startup; ComfyUI may choose different kernels per operation",
         "first_block_cache": {
             "mode": FIRST_BLOCK_CACHE_MODE,
-            "preset": FIRST_BLOCK_CACHE_SAFE_PRESET if FIRST_BLOCK_CACHE_MODE == "safe" else None,
+            "preset": FIRST_BLOCK_CACHE_PRESETS.get(FIRST_BLOCK_CACHE_MODE),
         },
         "capabilities": {
             "image_to_video": True,
@@ -648,7 +649,7 @@ async def health(authorization: str | None = Header(None)):
         "supported_durations_seconds": SUPPORTED_DURATIONS,
         "supported_steps": list(range(1, 51)),
         "supported_resolutions": list(SUPPORTED_RESOLUTIONS),
-        "default_parameters": {"mode": "turbo", "steps": 8, "resolution": DEFAULT_RESOLUTION, "lora_name": TURBO_LORA if turbo_available else None, "lora_strength": 1.0},
+        "default_parameters": {"mode": "turbo", "steps": DEFAULT_STEPS, "resolution": DEFAULT_RESOLUTION, "lora_name": TURBO_LORA if turbo_available else None, "lora_strength": 1.0},
         "supported_modes": ["base", "turbo"] if any_lora_available else ["base"],
     }
 
@@ -698,7 +699,7 @@ async def create_job(
     if mode not in {"base", "turbo"}:
         raise HTTPException(422, "mode must be base or turbo")
     if resolution not in SUPPORTED_RESOLUTIONS:
-        raise HTTPException(422, "resolution must be 480, 576, or 768")
+        raise HTTPException(422, "resolution must be 480, 576, 672, or 768")
     if lora_stack is None and (not math.isfinite(lora_strength) or not 0.0 <= lora_strength <= 2.0):
         raise HTTPException(422, "lora_strength must be between 0 and 2")
     available_loras = _available_lora_names()
@@ -717,17 +718,17 @@ async def create_job(
         raise HTTPException(422, str(exc)) from None
     except (TypeError, json.JSONDecodeError):
         raise HTTPException(422, "lora_stack must be a JSON array") from None
-    if FIRST_BLOCK_CACHE_MODE == "safe" or selected_stack:
+    if FIRST_BLOCK_CACHE_MODE != "off" or selected_stack:
         try:
             available_nodes = await comfy.health()
         except Exception:
             raise HTTPException(503, "ComfyUI is not ready") from None
-        if FIRST_BLOCK_CACHE_MODE == "safe" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
+        if FIRST_BLOCK_CACHE_MODE != "off" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
             raise HTTPException(503, "ComfyUI FirstBlockCache node is missing; install the pinned custom node or set IMAGINE_VIDEO_FIRST_BLOCK_CACHE=off")
         if selected_stack and "LoraLoaderModelOnly" not in available_nodes:
             raise HTTPException(503, "ComfyUI cannot load LoRAs")
     try:
-        selected_steps = 8 if steps is None and mode == "turbo" else sampling_steps(steps, default=12)
+        selected_steps = sampling_steps(steps)
     except ValueError as exc:
         raise HTTPException(422, "steps must be an integer from 1 to 50") from exc
     if not prompt.strip() or len(prompt) > 10000:

@@ -15,21 +15,26 @@ AUDIO_VAE = _models["audio_vae"]
 TURBO_LORA = _optional_models["fl2v_turbo_lora_8step"]
 VIDEO_FPS = 24
 SUPPORTED_DURATIONS = tuple(range(3, 31))
-DEFAULT_STEPS = 12
+DEFAULT_STEPS = 16
 ALLOWED_STEPS = tuple(range(1, 51))
-SUPPORTED_RESOLUTIONS = (480, 576, 768)
-DEFAULT_RESOLUTION = 768
+SUPPORTED_RESOLUTIONS = (480, 576, 672, 768)
+DEFAULT_RESOLUTION = 672
 FIRST_BLOCK_CACHE_NODE = "ApplyMiniMaxH3FirstBlockCache"
 FIRST_BLOCK_CACHE_SAFE_PRESET = "H3 Safe — 0.08 / max 2"
-FIRST_BLOCK_CACHE_MODES = ("safe", "off")
+FIRST_BLOCK_CACHE_FAST_PRESET = "H3 Fast — 0.10 / max 2"
+FIRST_BLOCK_CACHE_PRESETS = {
+    "safe": FIRST_BLOCK_CACHE_SAFE_PRESET,
+    "fast": FIRST_BLOCK_CACHE_FAST_PRESET,
+}
+FIRST_BLOCK_CACHE_MODES = ("fast", "safe", "off")
 
 
 def first_block_cache_mode(configured: str | None = None) -> str:
-    """Return the configured cache mode; Safe is on unless explicitly disabled."""
+    """Return configured FirstBlockCache mode; Safe is the default."""
     raw = os.environ.get("IMAGINE_VIDEO_FIRST_BLOCK_CACHE", "safe") if configured is None else configured
     mode = str(raw).strip().lower()
     if mode not in FIRST_BLOCK_CACHE_MODES:
-        raise ValueError("IMAGINE_VIDEO_FIRST_BLOCK_CACHE must be 'safe' or 'off'")
+        raise ValueError("IMAGINE_VIDEO_FIRST_BLOCK_CACHE must be 'fast', 'safe', or 'off'")
     return mode
 
 
@@ -54,10 +59,10 @@ def canvas_for_image(width: int, height: int, resolution: int = DEFAULT_RESOLUTI
     if width < 1 or height < 1:
         raise ValueError("Image dimensions must be positive")
     if resolution not in SUPPORTED_RESOLUTIONS:
-        raise ValueError("resolution must be 480, 576, or 768")
+        raise ValueError("resolution must be 480, 576, 672, or 768")
     ratio = width / height
     if resolution == 768 and 1.70 <= ratio <= 1.85:
-        # Preserve ComfyUI's documented native 16:9-ish canvas at the default.
+        # Preserve ComfyUI's documented native 16:9-ish canvas for this preset.
         return (1344, 768) if width >= height else (768, 1344)
     scale = resolution / min(width, height)
     max_long_edge = round((resolution * 1344 / 768) / 32) * 32
@@ -152,14 +157,14 @@ def build_workflow(
         graph["7"]["inputs"]["model"] = previous_model
         graph["10"]["inputs"]["model"] = previous_model
     cache_mode = first_block_cache_mode(first_block_cache)
-    if cache_mode == "safe":
+    if cache_mode != "off":
         cache_node_id = str(16 + len(stack))
         graph[cache_node_id] = {
             "class_type": FIRST_BLOCK_CACHE_NODE,
             "inputs": {
                 "model": previous_model,
-                "mode": FIRST_BLOCK_CACHE_SAFE_PRESET,
-                "threshold": 0.08,
+                "mode": FIRST_BLOCK_CACHE_PRESETS[cache_mode],
+                "threshold": 0.10 if cache_mode == "fast" else 0.08,
                 "start_percent": 0.10,
                 "end_percent": 0.95,
                 "max_consecutive_hits": 2,
@@ -189,10 +194,10 @@ def build_turbo_workflow(
     resolution: int = DEFAULT_RESOLUTION,
     lora_name: str = TURBO_LORA,
     lora_strength: float = 1.0,
-    steps: int = 8,
+    steps: int | None = None,
     first_block_cache: str | None = None,
 ) -> dict:
-    """Build the separate official 8-step LoRA I2V experiment graph."""
+    """Build the separate Turbo LoRA I2V experiment graph."""
     graph = build_workflow(
         prompt, image_filename, duration_seconds, seed,
         image_width, image_height, job_id, steps=steps, audio=audio,
