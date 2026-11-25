@@ -9,6 +9,19 @@ export COMFY_INPUT_DIR="$RUN_ROOT/comfy/input"
 export COMFY_OUTPUT_DIR="$RUN_ROOT/comfy/output"
 export COMFY_TEMP_DIR="$RUN_ROOT/comfy/temp"
 export IMAGINE_VIDEO_DATA="$RUN_ROOT/jobs"
+comfy_args=()
+case "${IMAGINE_H3_VRAM_PROFILE:-auto}" in
+  auto) ;;
+  high)
+    "${ROOT}/.venv-comfy/bin/python" -c 'import torch; assert torch.cuda.get_device_properties(0).total_memory >= 90 * 1024**3, "High VRAM profile requires at least 90 GiB VRAM"'
+    comfy_args+=(--highvram --reserve-vram 12)
+    ;;
+  *) echo "IMAGINE_H3_VRAM_PROFILE must be auto or high" >&2; exit 1 ;;
+esac
+case "${IMAGINE_H3_AUDIO:-1}" in
+  0|1) ;;
+  *) echo "IMAGINE_H3_AUDIO must be 0 or 1" >&2; exit 1 ;;
+esac
 
 : "${IMAGINE_VIDEO_TOKEN:?Set IMAGINE_VIDEO_TOKEN in the process environment}"
 command -v ffmpeg >/dev/null || { echo "ffmpeg is required" >&2; exit 1; }
@@ -65,15 +78,37 @@ trap cleanup_on_error EXIT
 "$ROOT/.venv-comfy/bin/python" "$ROOT/scripts/check_models.py"
 
 cd "$ROOT"
-# Prompts and images are transient; do not write ComfyUI/worker logs or prompt metadata to disk.
-"$ROOT/.venv-comfy/bin/python" "$COMFY_ROOT/main.py" \
-  --base-directory "$COMFY_ROOT" \
-  --input-directory "$COMFY_INPUT_DIR" \
-  --output-directory "$COMFY_OUTPUT_DIR" \
-  --temp-directory "$RUN_ROOT/comfy" \
-  --database-url sqlite:///:memory: \
-  --listen 127.0.0.1 --port 8188 --disable-auto-launch --disable-metadata \
-  >/dev/null 2>&1 &
+# Only allow fixed, upstream technical events on stdout. Comfy errors and
+# payload-derived strings stay out of container logs.
+log_comfy() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      'Using pytorch attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"pytorch_sdpa"}' ;;
+      'Using sage attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"sage"}' ;;
+      'Using Flash Attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"flash"}' ;;
+      'Using xformers attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"xformers"}' ;;
+      'Using Comfy Kitchen attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"comfy_kitchen"}' ;;
+      'Using split optimization for attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"split"}' ;;
+      'Using sub quadratic optimization for attention, if you have memory or speed issues try using: --use-split-cross-attention') echo 'imagine_metric {"event":"comfy_attention_selected","backend":"sub_quad"}' ;;
+    esac
+  done
+}
+run_comfy() {
+  exec "$ROOT/.venv-comfy/bin/python" "$COMFY_ROOT/main.py" \
+    --base-directory "$COMFY_ROOT" "${comfy_args[@]}" \
+    --input-directory "$COMFY_INPUT_DIR" \
+    --output-directory "$COMFY_OUTPUT_DIR" \
+    --temp-directory "$RUN_ROOT/comfy" \
+    --database-url sqlite:///:memory: \
+    --listen 127.0.0.1 --port 8188 --disable-auto-launch --disable-metadata
+}
+comfy_start_started=$SECONDS
+if [[ "${IMAGINE_DEBUG_METRICS:-0}" == "1" ]]; then
+  run_comfy > >(log_comfy) 2>&1 &
+else
+  run_comfy >/dev/null 2>&1 &
+fi
 comfy_pid=$!
 echo "$comfy_pid" > "$RUN_ROOT/pids/comfyui.pid"
 
@@ -83,10 +118,14 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 if [[ "$healthy" -ne 1 ]]; then echo "ComfyUI did not become healthy" >&2; exit 1; fi
+if [[ "${IMAGINE_DEBUG_METRICS:-0}" == "1" ]]; then
+  printf 'imagine_metric {"event":"comfy_available","seconds":%s}\n' "$((SECONDS-comfy_start_started))"
+fi
 
 # Provider ingress must terminate TLS and expose only this service on HTTPS port 8000.
+api_start_started=$SECONDS
 PYTHONPATH="$ROOT" "$ROOT/.venv-comfy/bin/uvicorn" app.main:app \
-  --host 0.0.0.0 --port 8000 >/dev/null 2>&1 &
+  --host 0.0.0.0 --port 8000 --no-access-log 2>/dev/null &
 worker_pid=$!
 echo "$worker_pid" > "$RUN_ROOT/pids/worker.pid"
 
@@ -103,6 +142,9 @@ done
 if [[ "$healthy" -ne 1 ]]; then
   echo "Worker did not become healthy; services stopped" >&2
   exit 1
+fi
+if [[ "${IMAGINE_DEBUG_METRICS:-0}" == "1" ]]; then
+  printf 'imagine_metric {"event":"api_available","seconds":%s}\n' "$((SECONDS-api_start_started))"
 fi
 trap - EXIT
 echo "Worker ready at http://127.0.0.1:8000/v1/health (expose only through HTTPS provider ingress)."

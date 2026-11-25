@@ -5,8 +5,10 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -16,8 +18,18 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from .comfy import ComfyClient, new_client_id
-from .workflow import TURBO_LORA, build_turbo_workflow, build_workflow, sampling_steps
+from .comfy import ComfyClient, ModelLoaderError, new_client_id
+from .lora_catalog import available_lora_names, resolve_lora_name, resolve_lora_stack
+from .workflow import (
+    DEFAULT_RESOLUTION,
+    SUPPORTED_DURATIONS,
+    SUPPORTED_RESOLUTIONS,
+    VIDEO_FPS,
+    TURBO_LORA,
+    build_workflow,
+    canvas_for_image,
+    sampling_steps,
+)
 
 TOKEN = os.environ.get("IMAGINE_VIDEO_TOKEN", "")
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
@@ -29,9 +41,57 @@ COMFY_OUTPUT_DIR = Path(os.environ.get("COMFY_OUTPUT_DIR", str(COMFY_ROOT / "out
 COMFY_TEMP_DIR = Path(os.environ.get("COMFY_TEMP_DIR", str(COMFY_ROOT / "temp")))
 DATA_ROOT = Path(os.environ.get("IMAGINE_VIDEO_DATA", "/tmp/imagine-video-worker"))
 MAX_UPLOAD_BYTES = int(os.environ.get("IMAGINE_VIDEO_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+MAX_LORA_UPLOAD_BYTES = int(os.environ.get("IMAGINE_VIDEO_MAX_LORA_UPLOAD_BYTES", str(4 * 1024 * 1024 * 1024)))
 JOB_TIMEOUT_SECONDS = max(60, int(os.environ.get("IMAGINE_VIDEO_JOB_TIMEOUT_SECONDS", str(90 * 60))))
 MAX_PIXELS = 40_000_000
 RETENTION_SECONDS = 15 * 60
+DEBUG_METRICS = os.environ.get("IMAGINE_DEBUG_METRICS", "0") == "1"
+AUDIO = os.environ.get("IMAGINE_H3_AUDIO", "1") == "1"
+COMFY_NODE_LABELS = {
+    "1": "diffusion_model_loader", "2": "text_encoder_loader",
+    "3": "video_vae_loader", "4": "audio_vae_loader", "5": "image_load",
+    "6": "prompt_and_image_encode", "11": "diffusion", "12": "video_vae_decode",
+    "13": "audio_decode", "14": "video_mux", "15": "mp4_export", "16": "turbo_lora",
+}
+VRAM_PROFILE = os.environ.get("IMAGINE_H3_VRAM_PROFILE", "auto")
+_generation_count = 0
+
+
+def _metric(event: str, **values):
+    """Emit technical-only diagnostics; never include request or credential data."""
+    if DEBUG_METRICS:
+        print("imagine_metric " + json.dumps({"event": event, **values}, sort_keys=True), flush=True)
+
+
+async def _sample_gpu_peak(stop: asyncio.Event, peaks: dict[str, int | None]):
+    """Sample NVIDIA device memory without touching prompts or media."""
+    while not stop.is_set():
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                output, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+            except asyncio.TimeoutError:
+                if proc.returncode is None:
+                    proc.kill()
+                await proc.wait()
+                raise
+            values = [int(line.strip()) for line in output.decode().splitlines() if line.strip().isdigit()]
+            if values:
+                peaks["vram_mb"] = max(peaks["vram_mb"] or 0, sum(values))
+        except (OSError, ValueError, asyncio.TimeoutError):
+            pass
+        try:
+            current = int(Path("/sys/fs/cgroup/memory.current").read_text().strip()) // (1024 * 1024)
+            peaks["container_ram_mb"] = max(peaks["container_ram_mb"] or 0, current)
+        except (OSError, ValueError):
+            pass
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
 
 app = FastAPI(title="Imagine Video Worker", docs_url=None, redoc_url=None)
 comfy = ComfyClient(COMFY_URL, COMFY_WS)
@@ -57,7 +117,15 @@ async def token_gate(request, call_next):
 
 
 def _snapshot(job: dict[str, Any]) -> dict[str, Any]:
-    return {key: job.get(key) for key in ("id", "status", "stage", "progress", "error", "steps", "mode")}
+    return {key: job.get(key) for key in ("id", "status", "stage", "progress", "error", "steps", "mode", "resolution", "effective_width", "effective_height", "lora_name", "lora_strength", "lora_stack")}
+
+
+def _available_lora_names() -> list[str]:
+    return available_lora_names(COMFY_ROOT / "models" / "loras")
+
+
+def _resolve_lora_name(mode: str, requested: str | None, available: list[str]) -> str | None:
+    return resolve_lora_name(mode, requested, available, TURBO_LORA)
 
 
 def _authorized(authorization: str | None):
@@ -98,6 +166,45 @@ async def _bytes_to_file(upload: UploadFile, target: Path) -> tuple[int, str, st
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
         raise HTTPException(415, "Uploaded file is not a supported image") from None
     return total, digest.hexdigest(), image_format, image_width, image_height
+
+
+def _safe_lora_filename(filename: str | None) -> str:
+    if (not filename or len(filename) > 255 or filename.startswith(".")
+            or Path(filename).name != filename or "/" in filename or "\\" in filename
+            or "\x00" in filename or not filename.endswith(".safetensors")):
+        raise HTTPException(422, "Upload a LoRA with a .safetensors basename")
+    return filename
+
+
+async def _store_lora(upload: UploadFile, filename: str) -> int:
+    """Stream a LoRA to a same-directory temporary file, then link it without clobbering."""
+    root = COMFY_ROOT / "models" / "loras"
+    if not root.is_dir():
+        raise HTTPException(503, "LoRA storage is not available")
+    target = root / filename
+    temp_path: Path | None = None
+    total = 0
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=".imagine-upload-", suffix=".part", dir=root)
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "wb") as output:
+            while chunk := await upload.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_LORA_UPLOAD_BYTES:
+                    raise HTTPException(413, "LoRA exceeds the upload limit")
+                output.write(chunk)
+            if not total:
+                raise HTTPException(422, "LoRA file is empty")
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temp_path, target)
+        except FileExistsError:
+            raise HTTPException(409, "A LoRA with that filename already exists") from None
+        return total
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _remove_owned_file(root: Path | None, relative: str):
@@ -146,11 +253,31 @@ def _cleanup(job: dict[str, Any], keep_result: bool = False):
 
 
 async def _run_job(job_id: str):
+    global _generation_count
     job = jobs.get(job_id)
     if not job or job["status"] != "queued":
         queue.task_done()
         return
     async with slot_lock:
+        resource_stop = asyncio.Event()
+        resource_peaks: dict[str, int | None] = {"vram_mb": None, "container_ram_mb": None}
+        resource_task = asyncio.create_task(_sample_gpu_peak(resource_stop, resource_peaks)) if DEBUG_METRICS else None
+        _generation_count += 1
+        generation_number = _generation_count
+        generation_started = time.perf_counter()
+        phase_started = generation_started
+        active_node: str | None = None
+        node_started = generation_started
+        previous_step: float | None = None
+        node_seconds: dict[str, float] = {}
+        step_seconds: list[float] = []
+        _metric(
+            "generation_started", generation=generation_number, warm=generation_number > 1,
+            generation_state="initial" if generation_number == 1 else "subsequent",
+            mode=job["mode"], steps=job["steps"], resolution=job["resolution"],
+            effective_width=job["effective_width"], effective_height=job["effective_height"],
+            lora_name=job.get("lora_name"), lora_strength=job["lora_strength"], lora_stack=job["lora_stack"],
+        )
         job["status"], job["stage"], job["progress"] = "running", "uploading_photo", None
         try:
             content_type = {".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}[job["input_path"].suffix]
@@ -158,21 +285,26 @@ async def _run_job(job_id: str):
             job["comfy_name"] = upload_name
             (job["folder"] / "remote.json").write_text(json.dumps({"comfy_name": upload_name}))
             comfy_name = await comfy.upload(job["input_path"], upload_name, content_type)
+            _metric("phase", name="image_upload", seconds=round(time.perf_counter() - phase_started, 3))
             job["comfy_name"] = comfy_name
             (job["folder"] / "remote.json").write_text(json.dumps({"comfy_name": comfy_name}))
             job["input_path"].unlink(missing_ok=True)
             if job["cancel_event"].is_set():
                 return
             job["stage"], job["progress"] = "generating_video", None
-            if job["mode"] == "turbo":
-                lora_file = COMFY_ROOT / "models" / "loras" / TURBO_LORA
-                if not lora_file.is_file():
-                    raise RuntimeError("Turbo mode requested but its 8-step LoRA is not installed")
-                workflow = build_turbo_workflow(job["prompt"], comfy_name, job["duration_seconds"], job["seed"], job["image_width"], job["image_height"], job["id"])
-            else:
-                workflow = build_workflow(job["prompt"], comfy_name, job["duration_seconds"], job["seed"], job["image_width"], job["image_height"], job["id"], steps=job["steps"])
+            phase_started = time.perf_counter()
+            if any(not (COMFY_ROOT / "models" / "loras" / item["name"]).is_file() for item in job["lora_stack"]):
+                raise RuntimeError("A selected LoRA is no longer available")
+            workflow = build_workflow(
+                job["prompt"], comfy_name, job["duration_seconds"], job["seed"],
+                job["image_width"], job["image_height"], job["id"],
+                steps=job["steps"], audio=AUDIO, resolution=job["resolution"],
+                lora_name=job.get("lora_name"), lora_strength=job["lora_strength"], lora_stack=job["lora_stack"],
+            )
+            job.pop("prompt", None)
             client_id = new_client_id()
             prompt_id = await comfy.queue(workflow, client_id)
+            del workflow
             job["prompt_id"] = prompt_id
             (job["folder"] / "remote.json").write_text(json.dumps({"comfy_name": comfy_name, "prompt_id": prompt_id}))
             if job["cancel_event"].is_set():
@@ -180,6 +312,21 @@ async def _run_job(job_id: str):
                 return
 
             def report(data):
+                nonlocal active_node, node_started, previous_step
+                if DEBUG_METRICS:
+                    now = time.perf_counter()
+                    if "node_started" in data:
+                        if active_node is not None:
+                            node_seconds[active_node] = node_seconds.get(active_node, 0.0) + now - node_started
+                        active_node = data["node_started"]
+                        node_started = now
+                        previous_step = now if active_node == "11" else None
+                    elif str(data.get("node")) == "11" and data.get("value") is not None:
+                        if previous_step is not None:
+                            step_seconds.append(round(now - previous_step, 3))
+                        previous_step = now
+                if "node_started" in data:
+                    return
                 if data.get("stage"):
                     job["stage"] = data["stage"]
                     return
@@ -191,9 +338,22 @@ async def _run_job(job_id: str):
                 job["stage"] = "generating_video"
 
             history = await comfy.wait(prompt_id, client_id, report, job["cancel_event"].is_set, JOB_TIMEOUT_SECONDS)
+            _metric(
+                "phase", name="comfy_generation", seconds=round(time.perf_counter() - phase_started, 3),
+                nodes={COMFY_NODE_LABELS[node]: round(seconds, 3) for node, seconds in node_seconds.items() if node in COMFY_NODE_LABELS},
+                diffusion_step_seconds=step_seconds,
+            )
+            for node in ("1", "2", "3", "4", "16"):
+                if node in node_seconds:
+                    _metric(
+                        "model_loader_node", loader=COMFY_NODE_LABELS[node],
+                        seconds=round(node_seconds[node], 3), generation=generation_number,
+                        load_state="initial" if generation_number == 1 else "subsequent",
+                    )
             if job["cancel_event"].is_set() or history is None:
                 return
             job["stage"] = "collecting_result"
+            phase_started = time.perf_counter()
             outputs = history.get("outputs", {})
             job["remote_outputs"] = [item for node in outputs.values() for item in (node.get("images", []) + node.get("gifs", []) + node.get("videos", []) + node.get("files", [])) if item.get("filename")]
             (job["folder"] / "remote.json").write_text(json.dumps({"comfy_name": comfy_name, "remote_outputs": job["remote_outputs"], "prompt_id": prompt_id}))
@@ -201,6 +361,7 @@ async def _run_job(job_id: str):
             if not info:
                 raise RuntimeError("ComfyUI finished without a video output")
             payload = await comfy.download(info)
+            _metric("phase", name="result_download", seconds=round(time.perf_counter() - phase_started, 3))
             if job["cancel_event"].is_set():
                 return
             if not payload:
@@ -208,26 +369,49 @@ async def _run_job(job_id: str):
             raw_path = job["folder"] / "comfy-output.mp4"
             result_path = job["folder"] / "result.mp4"
             raw_path.write_bytes(payload)
-            frame_count = 240 if job["duration_seconds"] == 10 else 360
-            command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-protocol_whitelist", "file,pipe", "-i", str(raw_path), "-map", "0:v:0", "-map", "0:a?", "-map_metadata", "-1", "-frames:v", str(frame_count), "-t", str(job["duration_seconds"]), "-vf", "fps=24", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-af", f"atrim=duration={job['duration_seconds']}", "-movflags", "+faststart", str(result_path)]
+            frame_count = job["duration_seconds"] * VIDEO_FPS
+            command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-protocol_whitelist", "file,pipe", "-i", str(raw_path), "-map", "0:v:0", "-map", "0:a?", "-map_metadata", "-1", "-frames:v", str(frame_count), "-t", str(job["duration_seconds"]), "-fps_mode", "passthrough", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-af", f"atrim=duration={job['duration_seconds']}", "-movflags", "+faststart", str(result_path)]
             process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            phase_started = time.perf_counter()
             communicate = asyncio.create_task(process.communicate())
             cancelled = asyncio.create_task(job["cancel_event"].wait())
-            done, _ = await asyncio.wait({communicate, cancelled}, return_when=asyncio.FIRST_COMPLETED)
-            if cancelled in done and job["cancel_event"].is_set():
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
-                await communicate
-                return
-            cancelled.cancel()
-            await asyncio.gather(cancelled, return_exceptions=True)
-            _, _ = communicate.result()
+            try:
+                done, _ = await asyncio.wait({communicate, cancelled}, return_when=asyncio.FIRST_COMPLETED)
+                if cancelled in done:
+                    return
+                communicate.result()
+            finally:
+                cancelled.cancel()
+                await asyncio.gather(cancelled, return_exceptions=True)
+                if process.returncode is None:
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(asyncio.shield(communicate), timeout=5)
+                    except asyncio.TimeoutError:
+                        if process.returncode is None:
+                            process.kill()
+                        await communicate
             if process.returncode:
                 raise RuntimeError("Video finalization failed")
+            probe = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                "stream=nb_frames,avg_frame_rate", "-of", "json", str(result_path),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                output, _ = await asyncio.wait_for(probe.communicate(), timeout=10)
+            finally:
+                if probe.returncode is None:
+                    probe.kill()
+                    await probe.wait()
+            streams = json.loads(output)["streams"] if probe.returncode == 0 else []
+            if (len(streams) != 1 or streams[0].get("nb_frames") != str(frame_count)
+                    or streams[0].get("avg_frame_rate") != f"{VIDEO_FPS}/1"):
+                raise RuntimeError("Video did not match the requested native frame count and FPS")
+            _metric("phase", name="mp4_finalize", seconds=round(time.perf_counter() - phase_started, 3))
             if job["cancel_event"].is_set():
                 return
             raw_path.unlink(missing_ok=True)
@@ -235,15 +419,13 @@ async def _run_job(job_id: str):
             # Keep the cleanup marker until Comfy's copies and history are gone.
             _purge_comfy_files(job)
             if job.get("prompt_id"):
-                try:
-                    await comfy.forget_prompt(job["prompt_id"])
-                except Exception:
-                    pass
+                await comfy.forget_prompt(job["prompt_id"])
             if job["cancel_event"].is_set():
                 return
             # The source image and all temporary inputs/intermediates are removed before download is exposed.
             _cleanup(job, keep_result=True)
             job.update(status="completed", stage="completed", progress=100, completed_at=time.time(), error=None)
+            _metric("generation_finished", status="completed", seconds=round(time.perf_counter() - generation_started, 3), generation=generation_number)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -264,9 +446,20 @@ async def _run_job(job_id: str):
                     _cleanup(job)
                 else:
                     job["remote_cleanup_pending"] = True
-                job.update(status="failed", stage="failed", progress=None, error="Video generation failed. Please try again.", completed_at=time.time())
+                public_error = "Video generation failed. Please try again."
+                if isinstance(exc, ModelLoaderError):
+                    public_error = "Model loading failed. Check model storage, permissions, file completeness, and mmap compatibility."
+                    _metric("model_loader_failure", generation=generation_number, loader=exc.loader, kind=exc.kind)
+                job.update(status="failed", stage="failed", progress=None, error=public_error, completed_at=time.time())
+                _metric("generation_finished", status="failed", seconds=round(time.perf_counter() - generation_started, 3), generation=generation_number)
         finally:
+            if resource_task:
+                resource_stop.set()
+                await asyncio.gather(resource_task, return_exceptions=True)
+                _metric("resource_peaks", generation=generation_number, **resource_peaks)
             if job["cancel_event"].is_set():
+                job.pop("prompt", None)
+                _metric("generation_finished", status="cancelled", seconds=round(time.perf_counter() - generation_started, 3), generation=generation_number)
                 stopped = True
                 if job.get("prompt_id"):
                     try:
@@ -281,6 +474,7 @@ async def _run_job(job_id: str):
                             pass
                     _purge_comfy_files(job)
                     _cleanup(job)
+            job.pop("prompt", None)
             queue.task_done()
 
 
@@ -327,6 +521,7 @@ async def _reaper():
 
 @app.on_event("startup")
 async def startup():
+    startup_started = time.perf_counter()
     if not DATA_ROOT.resolve().is_relative_to(Path("/tmp").resolve()):
         raise RuntimeError("Job storage must stay under /tmp")
     DATA_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -349,8 +544,15 @@ async def startup():
         else:
             child.unlink(missing_ok=True)
     global worker_task, reaper_task
+    if DEBUG_METRICS:
+        try:
+            import torch
+            _metric("runtime", torch=torch.__version__, cuda=torch.version.cuda, sdpa="PyTorch automatic dispatch (ComfyUI default)", optional_attention_backend="none pinned by this image")
+        except Exception:
+            _metric("runtime", sdpa="PyTorch automatic dispatch (ComfyUI default)", optional_attention_backend="none pinned by this image")
     worker_task = asyncio.create_task(_worker())
     reaper_task = asyncio.create_task(_reaper())
+    _metric("worker_startup", seconds=round(time.perf_counter() - startup_started, 3), vram_profile=VRAM_PROFILE, audio=AUDIO)
 
 
 @app.on_event("shutdown")
@@ -395,38 +597,106 @@ async def health(authorization: str | None = Header(None)):
         available_nodes = await comfy.health()
     except Exception:
         raise HTTPException(503, "Worker is not ready") from None
-    turbo_file = COMFY_ROOT / "models" / "loras" / TURBO_LORA
-    turbo_available = turbo_file.is_file() and "LoraLoaderModelOnly" in available_nodes
-    return {"status": "ok", "supported_steps": [8, 12, 20], "supported_modes": ["base", "turbo"] if turbo_available else ["base"]}
+    lora_names = _available_lora_names() if "LoraLoaderModelOnly" in available_nodes else []
+    turbo_available = TURBO_LORA in lora_names
+    any_lora_available = bool(lora_names)
+    return {
+        "status": "ok",
+        "model": "MiniMax H3 FL2VA INT8 ConvRot",
+        "attention_policy": "PyTorch automatic dispatch via ComfyUI; selected kernel may vary by operation",
+        "capabilities": {
+            "image_to_video": True,
+            "audio_output": AUDIO,
+            "audio_latents_generated": True,
+            "loras": bool(lora_names),
+            "default_lora": TURBO_LORA if turbo_available else None,
+            "durations_seconds": SUPPORTED_DURATIONS,
+        },
+        "supported_durations_seconds": SUPPORTED_DURATIONS,
+        "supported_steps": list(range(1, 51)),
+        "supported_resolutions": list(SUPPORTED_RESOLUTIONS),
+        "default_parameters": {"mode": "turbo", "steps": 8, "resolution": DEFAULT_RESOLUTION, "lora_name": TURBO_LORA if turbo_available else None, "lora_strength": 1.0},
+        "supported_modes": ["base", "turbo"] if any_lora_available else ["base"],
+    }
+
+
+@app.get("/v1/loras")
+async def list_loras(authorization: str | None = Header(None)):
+    _authorized(authorization)
+    try:
+        available_nodes = await comfy.health()
+    except Exception:
+        raise HTTPException(503, "ComfyUI is not ready") from None
+    names = _available_lora_names() if "LoraLoaderModelOnly" in available_nodes else []
+    return {
+        "loras": [{"name": name, "available": True, "default_strength": 1.0} for name in names],
+        "default_lora": TURBO_LORA if TURBO_LORA in names else None,
+    }
+
+
+@app.post("/v1/loras", status_code=201)
+async def upload_lora(file: UploadFile = File(...), authorization: str | None = Header(None)):
+    _authorized(authorization)
+    filename = _safe_lora_filename(file.filename)
+    try:
+        size = await _store_lora(file, filename)
+    finally:
+        await file.close()
+    return {"name": filename, "size": size}
 
 
 @app.post("/v1/jobs")
-async def create_job(file: UploadFile = File(...), prompt: str = Form(...), duration_seconds: int = Form(...), steps: int | None = Form(None), mode: str = Form("base"), authorization: str | None = Header(None), idempotency_key: str | None = Header(None, alias="Idempotency-Key")):
+async def create_job(
+    file: UploadFile = File(...),
+    prompt: str = Form(...),
+    duration_seconds: int = Form(...),
+    steps: int | None = Form(None),
+    mode: str = Form("turbo"),
+    resolution: int = Form(DEFAULT_RESOLUTION),
+    lora_name: str | None = Form(None),
+    lora_strength: float = Form(1.0),
+    lora_stack: str | None = Form(None),
+    authorization: str | None = Header(None),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
     _authorized(authorization)
-    if duration_seconds not in (10, 15):
-        raise HTTPException(422, "duration_seconds must be 10 or 15")
+    if duration_seconds not in SUPPORTED_DURATIONS:
+        raise HTTPException(422, "duration_seconds must be between 3 and 30")
     if mode not in {"base", "turbo"}:
         raise HTTPException(422, "mode must be base or turbo")
-    if mode == "turbo":
-        if steps not in (None, 8):
-            raise HTTPException(422, "Turbo mode requires 8 steps")
-        if not (COMFY_ROOT / "models" / "loras" / TURBO_LORA).is_file():
-            raise HTTPException(503, "Turbo mode is unavailable because its 8-step LoRA is not installed")
+    if resolution not in SUPPORTED_RESOLUTIONS:
+        raise HTTPException(422, "resolution must be 480, 576, or 768")
+    if lora_stack is None and (not math.isfinite(lora_strength) or not 0.0 <= lora_strength <= 2.0):
+        raise HTTPException(422, "lora_strength must be between 0 and 2")
+    available_loras = _available_lora_names()
+    if mode == "turbo" and lora_stack is None and not lora_name and TURBO_LORA not in available_loras:
+        raise HTTPException(503, "Turbo mode is unavailable because its default LoRA is not installed")
+    try:
+        if lora_stack is not None:
+            if lora_name is not None:
+                raise ValueError("Use either lora_stack or legacy lora_name/lora_strength, not both")
+            selected_stack = resolve_lora_stack(mode, json.loads(lora_stack), available_loras, TURBO_LORA)
+        elif lora_name:
+            selected_stack = resolve_lora_stack(mode, [{"name": lora_name, "strength": lora_strength}], available_loras, TURBO_LORA)
+        else:
+            selected_stack = resolve_lora_stack(mode, None, available_loras, TURBO_LORA)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    except (TypeError, json.JSONDecodeError):
+        raise HTTPException(422, "lora_stack must be a JSON array") from None
+    if selected_stack:
         try:
             available_nodes = await comfy.health()
         except Exception:
             raise HTTPException(503, "ComfyUI is not ready") from None
         if "LoraLoaderModelOnly" not in available_nodes:
-            raise HTTPException(503, "Turbo mode is unavailable because ComfyUI lacks LoraLoaderModelOnly")
-        selected_steps = 8
-    else:
-        try:
-            selected_steps = sampling_steps(steps)
-        except ValueError as exc:
-            raise HTTPException(422, "steps must be 8, 12, or 20") from exc
-    prompt = prompt.strip()
-    if not prompt or len(prompt) > 2000:
-        raise HTTPException(422, "Prompt must contain 1 to 2000 characters")
+            raise HTTPException(503, "ComfyUI cannot load LoRAs")
+    try:
+        selected_steps = 8 if steps is None and mode == "turbo" else sampling_steps(steps, default=12)
+    except ValueError as exc:
+        raise HTTPException(422, "steps must be an integer from 1 to 50") from exc
+    if not prompt.strip() or len(prompt) > 10000:
+        raise HTTPException(422, "Prompt must contain 1 to 10000 characters")
     if idempotency_key:
         if len(idempotency_key) > 200:
             raise HTTPException(422, "Idempotency-Key is too long")
@@ -455,7 +725,10 @@ async def create_job(file: UploadFile = File(...), prompt: str = Form(...), dura
         renamed = folder / ("input" + suffix)
         input_path.rename(renamed)
         input_path = renamed
-    job = {"id": job_id, "status": "queued", "stage": "queued", "progress": 0, "error": None, "prompt": prompt, "duration_seconds": duration_seconds, "steps": selected_steps, "mode": mode, "folder": folder, "input_path": input_path, "created_at": time.time(), "input_sha256": digest, "seed": int.from_bytes(os.urandom(8), "big"), "image_width": image_width, "image_height": image_height, "cancel_event": asyncio.Event()}
+    effective_width, effective_height = canvas_for_image(image_width, image_height, resolution)
+    legacy_name = selected_stack[0]["name"] if len(selected_stack) == 1 else None
+    legacy_strength = selected_stack[0]["strength"] if len(selected_stack) == 1 else float(lora_strength)
+    job = {"id": job_id, "status": "queued", "stage": "queued", "progress": 0, "error": None, "prompt": prompt, "duration_seconds": duration_seconds, "steps": selected_steps, "mode": mode, "resolution": resolution, "effective_width": effective_width, "effective_height": effective_height, "lora_name": legacy_name, "lora_strength": legacy_strength, "lora_stack": selected_stack, "folder": folder, "input_path": input_path, "created_at": time.time(), "input_sha256": digest, "seed": int.from_bytes(os.urandom(8), "big"), "image_width": image_width, "image_height": image_height, "cancel_event": asyncio.Event()}
     jobs[job_id] = job
     if idempotency_key:
         idempotency[idempotency_key] = job_id
@@ -533,6 +806,7 @@ async def delete_job(job_id: str, authorization: str | None = Header(None)):
                 pass
         if was_running:
             return _snapshot(job)
+        job.pop("prompt", None)
         _purge_comfy_files(job)
         _cleanup(job)
         return _snapshot(job)
