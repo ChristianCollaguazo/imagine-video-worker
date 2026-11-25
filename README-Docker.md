@@ -6,7 +6,7 @@ Requires the quantized INT8/NVFP4 manifest with the 8-step Turbo LoRA.
 
 ## RunPod sin Global Volume
 
-Usa `christiancollaguazo/imagine-video-worker:turbo-v1-download`, Container Disk de 100 GB,
+Usa `christiancollaguazo/imagine-video-worker:turbo-v4-download`, Container Disk de 100 GB,
 puerto HTTP 8000 y conserva el secreto del worker. Para esta modalidad, deja
 Global Volume sin adjuntar y configura:
 
@@ -36,7 +36,7 @@ cd ~/Documents/projects/Imagine/imagine-video-worker
 unzip -o ~/Downloads/imagine-runpod-docker.zip -d .
 docker login
 docker buildx build --platform linux/amd64 \
-  -t TU_USUARIO_DOCKERHUB/imagine-video-worker:turbo-v1-download --push .
+  -t TU_USUARIO_DOCKERHUB/imagine-video-worker:turbo-v4-download --push .
 ```
 
 Docker Desktop on Apple Silicon builds amd64 via emulation. No NVIDIA GPU is
