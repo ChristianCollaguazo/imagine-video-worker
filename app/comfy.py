@@ -13,14 +13,13 @@ MODEL_LOADER_TYPES = {
     "UNETLoader": "diffusion_model_loader",
     "CLIPLoader": "text_encoder_loader",
     "VAELoader": "vae_loader",
-    "LoraLoaderModelOnly": "turbo_lora_loader",
+    "LoraLoaderModelOnly": "lora_loader",
 }
 MODEL_LOADER_NODES = {
     "1": "diffusion_model_loader",
     "2": "text_encoder_loader",
     "3": "video_vae_loader",
     "4": "audio_vae_loader",
-    "16": "turbo_lora_loader",
 }
 
 

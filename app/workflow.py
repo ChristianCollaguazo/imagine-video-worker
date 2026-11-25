@@ -19,6 +19,18 @@ DEFAULT_STEPS = 12
 ALLOWED_STEPS = tuple(range(1, 51))
 SUPPORTED_RESOLUTIONS = (480, 576, 768)
 DEFAULT_RESOLUTION = 768
+FIRST_BLOCK_CACHE_NODE = "ApplyMiniMaxH3FirstBlockCache"
+FIRST_BLOCK_CACHE_SAFE_PRESET = "H3 Safe — 0.08 / max 2"
+FIRST_BLOCK_CACHE_MODES = ("safe", "off")
+
+
+def first_block_cache_mode(configured: str | None = None) -> str:
+    """Return the configured cache mode; Safe is on unless explicitly disabled."""
+    raw = os.environ.get("IMAGINE_VIDEO_FIRST_BLOCK_CACHE", "safe") if configured is None else configured
+    mode = str(raw).strip().lower()
+    if mode not in FIRST_BLOCK_CACHE_MODES:
+        raise ValueError("IMAGINE_VIDEO_FIRST_BLOCK_CACHE must be 'safe' or 'off'")
+    return mode
 
 
 def sampling_steps(configured: int | None = None, *, default: int = DEFAULT_STEPS) -> int:
@@ -89,6 +101,7 @@ def build_workflow(
     lora_name: str | None = None,
     lora_strength: float = 1.0,
     lora_stack: list[dict] | None = None,
+    first_block_cache: str | None = None,
 ) -> dict:
     """Build the ComfyUI API prompt graph for one image plus one prompt."""
     if not prompt.strip():
@@ -138,6 +151,23 @@ def build_workflow(
     if stack:
         graph["7"]["inputs"]["model"] = previous_model
         graph["10"]["inputs"]["model"] = previous_model
+    cache_mode = first_block_cache_mode(first_block_cache)
+    if cache_mode == "safe":
+        cache_node_id = str(16 + len(stack))
+        graph[cache_node_id] = {
+            "class_type": FIRST_BLOCK_CACHE_NODE,
+            "inputs": {
+                "model": previous_model,
+                "mode": FIRST_BLOCK_CACHE_SAFE_PRESET,
+                "threshold": 0.08,
+                "start_percent": 0.10,
+                "end_percent": 0.95,
+                "max_consecutive_hits": 2,
+                "temporal_guard": False,
+            },
+        }
+        graph["7"]["inputs"]["model"] = [cache_node_id, 0]
+        graph["10"]["inputs"]["model"] = [cache_node_id, 0]
     if not audio:
         # FL2VA still generates joint latents. Only skip decoding and muxing the audio.
         del graph["4"]
@@ -160,11 +190,13 @@ def build_turbo_workflow(
     lora_name: str = TURBO_LORA,
     lora_strength: float = 1.0,
     steps: int = 8,
+    first_block_cache: str | None = None,
 ) -> dict:
     """Build the separate official 8-step LoRA I2V experiment graph."""
     graph = build_workflow(
         prompt, image_filename, duration_seconds, seed,
         image_width, image_height, job_id, steps=steps, audio=audio,
         resolution=resolution, lora_name=lora_name, lora_strength=lora_strength,
+        first_block_cache=first_block_cache,
     )
     return graph

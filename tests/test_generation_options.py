@@ -1,9 +1,17 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from app.lora_catalog import available_lora_names, resolve_lora_name, resolve_lora_stack
-from app.workflow import build_workflow, canvas_for_image, sampling_steps
+from app.workflow import (
+    FIRST_BLOCK_CACHE_NODE,
+    FIRST_BLOCK_CACHE_SAFE_PRESET,
+    build_workflow,
+    canvas_for_image,
+    first_block_cache_mode,
+    sampling_steps,
+)
 
 
 class GenerationOptionsTests(unittest.TestCase):
@@ -36,13 +44,41 @@ class GenerationOptionsTests(unittest.TestCase):
         workflow = build_workflow(
             "a person walking", "input.png", 10, 1, 16, 9, "job",
             steps=4, resolution=480, lora_name="custom.safetensors", lora_strength=0.65,
-            audio=False,
+            audio=False, first_block_cache="off",
         )
         self.assertEqual(workflow["7"]["inputs"]["steps"], 4)
         self.assertEqual((workflow["6"]["inputs"]["width"], workflow["6"]["inputs"]["height"]), canvas_for_image(16, 9, 480))
         self.assertEqual(workflow["16"]["inputs"]["lora_name"], "custom.safetensors")
         self.assertEqual(workflow["16"]["inputs"]["strength_model"], 0.65)
         self.assertNotIn("13", workflow)
+
+    def test_first_block_cache_defaults_to_safe_and_can_be_disabled_explicitly(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(first_block_cache_mode(), "safe")
+        workflow = build_workflow("walk", "input.png", 5, 4, first_block_cache="safe")
+        self.assertEqual(workflow["16"]["class_type"], FIRST_BLOCK_CACHE_NODE)
+        self.assertEqual(workflow["16"]["inputs"]["mode"], FIRST_BLOCK_CACHE_SAFE_PRESET)
+        self.assertEqual(workflow["16"]["inputs"]["threshold"], 0.08)
+        self.assertEqual(workflow["7"]["inputs"]["model"], ["16", 0])
+        self.assertEqual(workflow["10"]["inputs"]["model"], ["16", 0])
+
+        uncached = build_workflow("walk", "input.png", 5, 4, first_block_cache="off")
+        self.assertNotIn("16", uncached)
+        self.assertEqual(uncached["7"]["inputs"]["model"], ["1", 0])
+        self.assertEqual(uncached["10"]["inputs"]["model"], ["1", 0])
+
+    def test_first_block_cache_wraps_the_final_lora_model_and_rejects_unknown_modes(self):
+        workflow = build_workflow(
+            "walk", "input.png", 5, 4,
+            lora_stack=[{"name": "one.safetensors", "strength": 0.5}],
+            first_block_cache="safe",
+        )
+        self.assertEqual(workflow["17"]["class_type"], FIRST_BLOCK_CACHE_NODE)
+        self.assertEqual(workflow["17"]["inputs"]["model"], ["16", 0])
+        self.assertEqual(workflow["7"]["inputs"]["model"], ["17", 0])
+        self.assertEqual(workflow["10"]["inputs"]["model"], ["17", 0])
+        with self.assertRaises(ValueError):
+            first_block_cache_mode("fast")
 
     def test_lora_catalog_is_rescanned_and_only_returns_basenames(self):
         with TemporaryDirectory() as directory:
@@ -88,6 +124,7 @@ class GenerationOptionsTests(unittest.TestCase):
         workflow = build_workflow(
             "x" * 10000, "input.png", 10, 1, 16, 9, "job", steps=8,
             lora_stack=[{"name": "one.safetensors", "strength": 0.25}, {"name": "two.safetensors", "strength": 1.5}],
+            first_block_cache="off",
         )
         self.assertEqual(workflow["6"]["inputs"]["prompt"], "x" * 10000)
         self.assertEqual(workflow["16"]["inputs"], {"model": ["1", 0], "lora_name": "one.safetensors", "strength_model": 0.25})

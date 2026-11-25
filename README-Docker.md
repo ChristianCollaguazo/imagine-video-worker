@@ -4,6 +4,37 @@ Add these files to the root of the existing imagine-video-worker checkout. The
 image uses the repository's manifest, app and start/stop scripts, not a new API.
 Requires the quantized INT8/NVFP4 manifest with the 8-step Turbo LoRA.
 
+## Rama experimental `experiment/h3-sage-firstblock`
+
+Esta rama prueba SageAttention en SM120 y FirstBlockCache; no es una imagen
+validada para producción. El Dockerfile instala por defecto una rueda Linux
+`x86_64` community-built para Python 3.12, PyTorch 2.11.0+cu130 y kernels SM120.
+La URL apunta al commit inmutable `8109741f23e8e065178bb26710f543e501f5f54f` y
+el build exige que coincida el SHA-256 publicado: `4a47a462059bf09b7d10be68f93a0a462dd6184068298fc6ff10e94751fa6dd4`.
+No es una rueda oficial ni un build reproducible bit a bit: su autor declara
+que fue probado en un pase CUDA corto, sin pruebas de precisión o integración
+de modelo, y que los timestamps pueden variar entre rebuilds. No se compila
+Sage desde el contenedor porque el runtime base no garantiza `nvcc`.
+
+```bash
+cd ~/Documents/projects/Imagine/imagine-worker-experimental
+docker buildx build --platform linux/amd64 \
+  -t imagine-video-worker:h3-sage-experimental --load .
+```
+
+Se pueden sustituir URL y hash mediante argumentos build, manteniéndolos en
+pareja. El build verifica el hash antes de instalar. Por defecto
+`IMAGINE_SAGE_ATTENTION=on`: al arrancar se ejecuta una prueba
+CUDA corta, y el proceso falla si la GPU no es SM120 o SageAttention no pasa la
+prueba. `IMAGINE_SAGE_ATTENTION=off` elige PyTorch explícitamente; `auto` permite
+fallback y registra el motivo en `imagine_attention`. El evento confirma la
+selección inicial; el log `Using sage attention` confirma el backend elegido
+por ComfyUI. Las pruebas unitarias del selector no sustituyen inferencia real.
+
+No se ha ejecutado un Docker build, una instalación de rueda ni inferencia H3
+con SageAttention en RTX PRO 6000/SM120; primero valida la rueda y después haz
+una generación aislada antes de usar esta rama con tráfico.
+
 ## RunPod sin Global Volume
 
 Usa `christiancollaguazo/imagine-video-worker:turbo-v4-download`, Container Disk de 100 GB,

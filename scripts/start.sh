@@ -22,11 +22,20 @@ case "${IMAGINE_H3_AUDIO:-1}" in
   0|1) ;;
   *) echo "IMAGINE_H3_AUDIO must be 0 or 1" >&2; exit 1 ;;
 esac
+case "${IMAGINE_SAGE_ATTENTION:-on}" in
+  auto|on|off) ;;
+  *) echo "IMAGINE_SAGE_ATTENTION must be auto, on, or off" >&2; exit 1 ;;
+esac
 
 : "${IMAGINE_VIDEO_TOKEN:?Set IMAGINE_VIDEO_TOKEN in the process environment}"
 command -v ffmpeg >/dev/null || { echo "ffmpeg is required" >&2; exit 1; }
 command -v ffprobe >/dev/null || { echo "ffprobe is required" >&2; exit 1; }
 "$ROOT/.venv-comfy/bin/python" -c 'import torch, torchaudio; assert torch.cuda.is_available(), "CUDA is unavailable to PyTorch"; assert torch.cuda.is_bf16_supported(), "GPU does not report BF16 support"'
+attention_status="$(PYTHONPATH="$ROOT" "$ROOT/.venv-comfy/bin/python" -m app.attention_backend)"
+attention_backend="$(printf '%s' "$attention_status" | "$ROOT/.venv-comfy/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["backend"])')"
+export IMAGINE_SELECTED_ATTENTION_BACKEND="$attention_backend"
+if [[ "$attention_backend" == sage ]]; then comfy_args+=(--use-sage-attention); fi
+printf 'imagine_attention %s\n' "$attention_status"
 "$ROOT/.venv-comfy/bin/python" -c 'import socket; a=socket.socket(); a.bind(("127.0.0.1",8188)); b=socket.socket(); b.bind(("0.0.0.0",8000)); a.close(); b.close()' || { echo "A required service port is already in use" >&2; exit 1; }
 mkdir -p "$COMFY_INPUT_DIR" "$COMFY_OUTPUT_DIR" "$COMFY_TEMP_DIR" "$IMAGINE_VIDEO_DATA" "$RUN_ROOT/pids"
 chmod 700 "$RUN_ROOT" "$RUN_ROOT/jobs" "$RUN_ROOT/pids"

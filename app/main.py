@@ -22,12 +22,15 @@ from .comfy import ComfyClient, ModelLoaderError, new_client_id
 from .lora_catalog import available_lora_names, resolve_lora_name, resolve_lora_stack
 from .workflow import (
     DEFAULT_RESOLUTION,
+    FIRST_BLOCK_CACHE_NODE,
+    FIRST_BLOCK_CACHE_SAFE_PRESET,
     SUPPORTED_DURATIONS,
     SUPPORTED_RESOLUTIONS,
     VIDEO_FPS,
     TURBO_LORA,
     build_workflow,
     canvas_for_image,
+    first_block_cache_mode,
     sampling_steps,
 )
 
@@ -47,11 +50,13 @@ MAX_PIXELS = 40_000_000
 RETENTION_SECONDS = 15 * 60
 DEBUG_METRICS = os.environ.get("IMAGINE_DEBUG_METRICS", "0") == "1"
 AUDIO = os.environ.get("IMAGINE_H3_AUDIO", "1") == "1"
+FIRST_BLOCK_CACHE_MODE = first_block_cache_mode()
+ATTENTION_BACKEND_SELECTED = os.environ.get("IMAGINE_SELECTED_ATTENTION_BACKEND", "unverified")
 COMFY_NODE_LABELS = {
     "1": "diffusion_model_loader", "2": "text_encoder_loader",
     "3": "video_vae_loader", "4": "audio_vae_loader", "5": "image_load",
     "6": "prompt_and_image_encode", "11": "diffusion", "12": "video_vae_decode",
-    "13": "audio_decode", "14": "video_mux", "15": "mp4_export", "16": "turbo_lora",
+    "13": "audio_decode", "14": "video_mux", "15": "mp4_export",
 }
 VRAM_PROFILE = os.environ.get("IMAGINE_H3_VRAM_PROFILE", "auto")
 _generation_count = 0
@@ -270,6 +275,7 @@ async def _run_job(job_id: str):
         node_started = generation_started
         previous_step: float | None = None
         node_seconds: dict[str, float] = {}
+        node_labels = dict(COMFY_NODE_LABELS)
         step_seconds: list[float] = []
         _metric(
             "generation_started", generation=generation_number, warm=generation_number > 1,
@@ -277,6 +283,8 @@ async def _run_job(job_id: str):
             mode=job["mode"], steps=job["steps"], resolution=job["resolution"],
             effective_width=job["effective_width"], effective_height=job["effective_height"],
             lora_name=job.get("lora_name"), lora_strength=job["lora_strength"], lora_stack=job["lora_stack"],
+            first_block_cache_mode=FIRST_BLOCK_CACHE_MODE,
+            first_block_cache_preset=FIRST_BLOCK_CACHE_SAFE_PRESET if FIRST_BLOCK_CACHE_MODE == "safe" else None,
         )
         job["status"], job["stage"], job["progress"] = "running", "uploading_photo", None
         try:
@@ -301,6 +309,10 @@ async def _run_job(job_id: str):
                 steps=job["steps"], audio=AUDIO, resolution=job["resolution"],
                 lora_name=job.get("lora_name"), lora_strength=job["lora_strength"], lora_stack=job["lora_stack"],
             )
+            for index in range(len(job["lora_stack"])):
+                node_labels[str(16 + index)] = f"lora_loader_{index + 1}"
+            if FIRST_BLOCK_CACHE_MODE == "safe":
+                node_labels[str(16 + len(job["lora_stack"]))] = "first_block_cache"
             job.pop("prompt", None)
             client_id = new_client_id()
             prompt_id = await comfy.queue(workflow, client_id)
@@ -340,13 +352,14 @@ async def _run_job(job_id: str):
             history = await comfy.wait(prompt_id, client_id, report, job["cancel_event"].is_set, JOB_TIMEOUT_SECONDS)
             _metric(
                 "phase", name="comfy_generation", seconds=round(time.perf_counter() - phase_started, 3),
-                nodes={COMFY_NODE_LABELS[node]: round(seconds, 3) for node, seconds in node_seconds.items() if node in COMFY_NODE_LABELS},
+                nodes={node_labels[node]: round(seconds, 3) for node, seconds in node_seconds.items() if node in node_labels},
                 diffusion_step_seconds=step_seconds,
             )
-            for node in ("1", "2", "3", "4", "16"):
+            loader_nodes = ("1", "2", "3", "4", *(str(16 + index) for index in range(len(job["lora_stack"]))))
+            for node in loader_nodes:
                 if node in node_seconds:
                     _metric(
-                        "model_loader_node", loader=COMFY_NODE_LABELS[node],
+                        "model_loader_node", loader=node_labels[node],
                         seconds=round(node_seconds[node], 3), generation=generation_number,
                         load_state="initial" if generation_number == 1 else "subsequent",
                     )
@@ -547,12 +560,25 @@ async def startup():
     if DEBUG_METRICS:
         try:
             import torch
-            _metric("runtime", torch=torch.__version__, cuda=torch.version.cuda, sdpa="PyTorch automatic dispatch (ComfyUI default)", optional_attention_backend="none pinned by this image")
+            _metric(
+                "runtime", torch=torch.__version__, cuda=torch.version.cuda,
+                attention_backend_selected=ATTENTION_BACKEND_SELECTED,
+                attention_selection_source="startup probe; ComfyUI startup log is authoritative",
+            )
         except Exception:
-            _metric("runtime", sdpa="PyTorch automatic dispatch (ComfyUI default)", optional_attention_backend="none pinned by this image")
+            _metric(
+                "runtime", attention_backend_selected=ATTENTION_BACKEND_SELECTED,
+                attention_selection_source="startup probe; ComfyUI startup log is authoritative",
+            )
     worker_task = asyncio.create_task(_worker())
     reaper_task = asyncio.create_task(_reaper())
-    _metric("worker_startup", seconds=round(time.perf_counter() - startup_started, 3), vram_profile=VRAM_PROFILE, audio=AUDIO)
+    _metric(
+        "worker_startup", seconds=round(time.perf_counter() - startup_started, 3),
+        vram_profile=VRAM_PROFILE, audio=AUDIO,
+        attention_backend_selected=ATTENTION_BACKEND_SELECTED,
+        first_block_cache_mode=FIRST_BLOCK_CACHE_MODE,
+        first_block_cache_preset=FIRST_BLOCK_CACHE_SAFE_PRESET if FIRST_BLOCK_CACHE_MODE == "safe" else None,
+    )
 
 
 @app.on_event("shutdown")
@@ -597,13 +623,20 @@ async def health(authorization: str | None = Header(None)):
         available_nodes = await comfy.health()
     except Exception:
         raise HTTPException(503, "Worker is not ready") from None
+    if FIRST_BLOCK_CACHE_MODE == "safe" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
+        raise HTTPException(503, "ComfyUI FirstBlockCache node is missing; install the pinned custom node or set IMAGINE_VIDEO_FIRST_BLOCK_CACHE=off")
     lora_names = _available_lora_names() if "LoraLoaderModelOnly" in available_nodes else []
     turbo_available = TURBO_LORA in lora_names
     any_lora_available = bool(lora_names)
     return {
         "status": "ok",
         "model": "MiniMax H3 FL2VA INT8 ConvRot",
-        "attention_policy": "PyTorch automatic dispatch via ComfyUI; selected kernel may vary by operation",
+        "attention_backend_selection": ATTENTION_BACKEND_SELECTED,
+        "attention_policy": "Selected at worker startup; ComfyUI may choose different kernels per operation",
+        "first_block_cache": {
+            "mode": FIRST_BLOCK_CACHE_MODE,
+            "preset": FIRST_BLOCK_CACHE_SAFE_PRESET if FIRST_BLOCK_CACHE_MODE == "safe" else None,
+        },
         "capabilities": {
             "image_to_video": True,
             "audio_output": AUDIO,
@@ -684,12 +717,14 @@ async def create_job(
         raise HTTPException(422, str(exc)) from None
     except (TypeError, json.JSONDecodeError):
         raise HTTPException(422, "lora_stack must be a JSON array") from None
-    if selected_stack:
+    if FIRST_BLOCK_CACHE_MODE == "safe" or selected_stack:
         try:
             available_nodes = await comfy.health()
         except Exception:
             raise HTTPException(503, "ComfyUI is not ready") from None
-        if "LoraLoaderModelOnly" not in available_nodes:
+        if FIRST_BLOCK_CACHE_MODE == "safe" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
+            raise HTTPException(503, "ComfyUI FirstBlockCache node is missing; install the pinned custom node or set IMAGINE_VIDEO_FIRST_BLOCK_CACHE=off")
+        if selected_stack and "LoraLoaderModelOnly" not in available_nodes:
             raise HTTPException(503, "ComfyUI cannot load LoRAs")
     try:
         selected_steps = 8 if steps is None and mode == "turbo" else sampling_steps(steps, default=12)
