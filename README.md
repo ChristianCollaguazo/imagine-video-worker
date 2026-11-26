@@ -4,6 +4,8 @@ Servicio privado de una sola cola para convertir **una imagen inicial y un promp
 
 ## Estado y alcance
 
+La configuración estable 1 para H3 es **v5 Sage + Safe**: SageAttention activado en SM120, FirstBlockCache con preset Safe, resolución predeterminada 672 y 16 pasos. Los defaults de ejecución se pueden sobrescribir mediante las variables de entorno y opciones de la API documentadas abajo.
+
 - `app/` contiene el worker privado y el adaptador ComfyUI.
 - `config/model-manifest.json` es la única fuente de verdad para revisiones, archivos y SHA-256 de pesos.
 - `scripts/` trae bootstrap, descarga verificada, inicio y apagado. Bootstrap no instala ni descarga nada si no se pasa una opción explícita.
@@ -50,7 +52,7 @@ Registro inicial para orientar pruebas futuras. Son tiempos de nodo reportados p
 
 | Perfil | Resolución | Pasos | LoRA | Caché | Total (s) | Difusión (s) | Exportación (s) | Codificación prompt (s) | VRAM (MiB) |
 |---|---:|---:|---|---|---:|---:|---:|---:|---:|
-| v5 Sage + Safe | 672×1184 | 16 | No | Frío | 192.471 | 160.390 | 10.429 | — | 47 735 |
+| Estable 1 — v5 Sage + Safe | 672×1184 | 16 | No | Frío | 192.471 | 160.390 | 10.429 | — | 47 735 |
 | Spark Fidelity | 672×1184 | 16 | No | Frío | 199.109 | 170.303 | 9.792 | — | 44 139 |
 | Spark Fidelity | 672×1184 | 16 | No | Caliente (previo) | 174.344 | 156.102 | 8.574 | — | — |
 | Spark Speed | 672×1184 | 16 | 0.75 | Frío | 373.882 | 164.867 | 91.026 | 77.606 | — |
