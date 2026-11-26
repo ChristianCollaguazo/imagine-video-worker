@@ -1,6 +1,6 @@
 # Imagine Video Worker (standalone)
 
-Servicio privado de una sola cola para convertir **una imagen inicial y un prompt** en un MP4 de 10 o 15 segundos. Base y Turbo reutilizan un único stack oficial H3 cuantizado: difusión FL2VA INT8 ConvRot, encoder Qwen3VL NVFP4-AWQ y VAE de video INT8. Base no usa LoRA; Turbo aplica la LoRA Lightning oficial a 8 pasos. Turbo es un experimento que se espera que genere más rápido, pero la calidad no está garantizada; la guía oficial advierte que puede suavizar el movimiento y el audio. La cuantización y Turbo tampoco cuentan con una evaluación de calidad en este worker. Este worker se ejecuta desde el repositorio privado desplegado en la Pod de servicio.
+Servicio privado de una sola cola para convertir **una imagen inicial y un prompt** en un MP4 de 3 a 30 segundos. Base y Turbo reutilizan un único stack oficial H3 cuantizado: difusión FL2VA INT8 ConvRot, encoder Qwen3VL NVFP4-AWQ y VAE de video INT8. Base no usa LoRA; Turbo aplica la LoRA Lightning oficial de 8 pasos si está instalada. Turbo es un experimento; la calidad no está garantizada y la guía oficial advierte que puede suavizar el movimiento y el audio. La cuantización y Turbo tampoco cuentan con una evaluación de calidad en este worker. Este worker se ejecuta desde el repositorio privado o desde la imagen documentada en [README-Docker.md](README-Docker.md).
 
 ## Estado y alcance
 
@@ -98,7 +98,48 @@ El apagado pide terminación normal al worker y a ComfyUI. Al volver a iniciar, 
 
 ## API privada
 
-Cada petición de trabajo necesita `Authorization: Bearer <IMAGINE_VIDEO_TOKEN>`, una imagen JPEG/PNG/WebP, el prompt y `duration_seconds` igual a 10 o 15. Hay una sola tarea activa y no se aceptan imágenes por lote ni imágenes finales opcionales. La respuesta del worker incluye un ID; consulta ese trabajo hasta `completed`, descarga el MP4 y envía el ACK para purgarlo. Los endpoints y los límites de carga están en `app/main.py`.
+### Variables de entorno
+
+El contenedor `release-v1` fija algunos valores en el Dockerfile; los valores
+entre paréntesis son los defaults del código cuando se ejecuta fuera de esa
+imagen. `IMAGINE_VIDEO_TOKEN` siempre es obligatorio al iniciar el worker.
+
+| Variable | Valor predeterminado | Descripción |
+|---|---|---|
+| `IMAGINE_VIDEO_TOKEN` | requerido | Token Bearer de la API; inyectar desde el gestor de secretos. |
+| `IMAGINE_MODEL_STORAGE_MODE` | `local` | `local`: requiere Global Volume; `download`: descarga a disco local y requiere `IMAGINE_DOWNLOAD_MODELS=1`. |
+| `IMAGINE_DOWNLOAD_MODELS` | `0` | Habilita descarga de modelos fijados por manifiesto. |
+| `IMAGINE_GLOBAL_MOUNT` | `/workspace-global` | Punto de montaje persistente para el modo `local`. |
+| `HF_TOKEN` | vacío | Token opcional para descargas restringidas de Hugging Face. |
+| `IMAGINE_VIDEO_STEPS` | `16` | Pasos por defecto, de 1 a 50; una solicitud puede sobrescribirlo. |
+| `IMAGINE_VIDEO_FIRST_BLOCK_CACHE` | `safe` | `safe`, `fast` u `off`; por defecto preset `H3 Safe — 0.08 / max 2`. |
+| `IMAGINE_SAGE_ATTENTION` | `on` en Docker (`auto` en código) | `on` requiere SM120; `auto` permite fallback; `off` usa PyTorch SDPA. |
+| `IMAGINE_H3_AUDIO` | `1` | Solo el texto exacto `1` habilita audio. |
+| `IMAGINE_H3_VRAM_PROFILE` | `auto` | Perfil de VRAM de ComfyUI H3. |
+| `IMAGINE_DEBUG_METRICS` | `0` | Con `1`, imprime métricas técnicas sin prompts ni medios. |
+| `IMAGINE_VIDEO_JOB_TIMEOUT_SECONDS` | `5400` | Timeout de generación en segundos; mínimo efectivo 60. |
+| `IMAGINE_VIDEO_MAX_UPLOAD_BYTES` | `52428800` | Máximo para imagen de entrada (50 MiB). |
+| `IMAGINE_VIDEO_MAX_LORA_UPLOAD_BYTES` | `4294967296` | Máximo para carga de LoRA (4 GiB). |
+| `COMFY_URL` | `http://127.0.0.1:8188` | Endpoint HTTP interno de ComfyUI. |
+| `COMFY_WS` | URL WebSocket derivada | Endpoint WebSocket; por defecto se deriva de `COMFY_URL` añadiendo `/ws`. |
+| `IMAGINE_VIDEO_DATA` | `/tmp/imagine-video-worker` | Datos transitorios de trabajos y resultados. El script de inicio lo fija bajo `/tmp`. |
+
+Ejemplo para poblar por primera vez un Global Volume:
+
+```dotenv
+IMAGINE_VIDEO_TOKEN={{ RUNPOD_SECRET_imagine_video_token }}
+IMAGINE_MODEL_STORAGE_MODE=local
+IMAGINE_DOWNLOAD_MODELS=1
+IMAGINE_GLOBAL_MOUNT=/workspace-global
+HF_TOKEN={{ RUNPOD_SECRET_hf_token }}
+```
+
+Tras validar que el volumen contiene los pesos, usa `IMAGINE_DOWNLOAD_MODELS=0`
+en los arranques siguientes. Para descarga a disco local, configura
+`IMAGINE_MODEL_STORAGE_MODE=download` y `IMAGINE_DOWNLOAD_MODELS=1`; cada
+contenedor nuevo volverá a descargar los modelos.
+
+Cada petición de trabajo necesita `Authorization: Bearer <IMAGINE_VIDEO_TOKEN>`, una imagen JPEG/PNG/WebP, el prompt y `duration_seconds` entero entre 3 y 30 (obligatorio, sin default). Hay una sola tarea activa y no se aceptan imágenes por lote ni imágenes finales opcionales. `mode` por defecto es `turbo`, `resolution` es 672, y los pasos usan el default 16 salvo que se indiquen en la petición. La respuesta del worker incluye un ID; consulta ese trabajo hasta `completed`, descarga el MP4 y envía el ACK para purgarlo. Los endpoints y los límites de carga están en `app/main.py`.
 
 | Ruta | Acción | Comportamiento |
 |---|---|---|

@@ -1,136 +1,119 @@
-# Imagine Video Worker — RunPod Docker
+# Imagine Video Worker — Docker release v1
 
-Add these files to the root of the existing imagine-video-worker checkout. The
-image uses the repository's manifest, app and start/stop scripts, not a new API.
-Requires the quantized INT8/NVFP4 manifest with the 8-step Turbo LoRA.
+Imagen de release para desplegar el worker privado en una Pod Linux con NVIDIA.
+La etiqueta corregida es `christiancollaguazo/imagine-video-worker:release-v1`.
+El `Dockerfile` parte de la imagen validada `turbo-v1`, conserva los pesos H3
+fijados por manifiesto fuera de la imagen y añade el worker, FirstBlockCache y
+SageAttention. La imagen requiere GPU SM120 (Blackwell) con la rueda SageAttention
+incluida; consulta `IMAGINE_SAGE_ATTENTION` para elegir explícitamente otro backend.
 
-## Rama experimental `experiment/h3-sage-firstblock`
+## Construir y publicar
 
-Esta rama prueba SageAttention en SM120 y FirstBlockCache; no es una imagen
-validada para producción. El Dockerfile instala por defecto una rueda Linux
-`x86_64` community-built para Python 3.12, PyTorch 2.11.0+cu130 y kernels SM120.
-La URL apunta al commit inmutable `8109741f23e8e065178bb26710f543e501f5f54f` y
-el build exige que coincida el SHA-256 publicado: `4a47a462059bf09b7d10be68f93a0a462dd6184068298fc6ff10e94751fa6dd4`.
-No es una rueda oficial ni un build reproducible bit a bit: su autor declara
-que fue probado en un pase CUDA corto, sin pruebas de precisión o integración
-de modelo, y que los timestamps pueden variar entre rebuilds. No se compila
-Sage desde el contenedor porque el runtime base no garantiza `nvcc`.
+Desde la raíz del repositorio, con Docker Desktop iniciado y sesión en Docker Hub:
 
 ```bash
-cd ~/Documents/projects/Imagine/imagine-worker-experimental
+docker login
 docker buildx build --platform linux/amd64 \
-  -t imagine-video-worker:h3-sage-experimental --load .
+  --build-arg IMAGINE_SOURCE_COMMIT="$(git rev-parse HEAD)" \
+  -t christiancollaguazo/imagine-video-worker:release-v1 --push .
 ```
 
-Se pueden sustituir URL y hash mediante argumentos build, manteniéndolos en
-pareja. El build verifica el hash antes de instalar. Por defecto
-`IMAGINE_SAGE_ATTENTION=on`: al arrancar se ejecuta una prueba
-CUDA corta, y el proceso falla si la GPU no es SM120 o SageAttention no pasa la
-prueba. `IMAGINE_SAGE_ATTENTION=off` elige PyTorch explícitamente; `auto` permite
-fallback y registra el motivo en `imagine_attention`. El evento confirma la
-selección inicial; el log `Using sage attention` confirma el backend elegido
-por ComfyUI. Las pruebas unitarias del selector no sustituyen inferencia real.
+Para construir y cargar localmente en vez de publicar, sustituye `--push` por
+`--load`. Los argumentos `SAGEATTENTION_WHEEL_URL` y
+`SAGEATTENTION_WHEEL_SHA256` permiten fijar otra rueda `.whl` y su SHA-256
+conjuntamente. El Dockerfile verifica el hash antes de instalarla. La rueda
+predeterminada es community-built para Linux x86_64, Python 3.12,
+PyTorch 2.11.0+cu130 y SM120; no es una distribución oficial de SageAttention.
+No se ha ejecutado aquí un build ni inferencia CUDA.
 
-No se ha ejecutado un Docker build, una instalación de rueda ni inferencia H3
-con SageAttention en RTX PRO 6000/SM120; primero valida la rueda y después haz
-una generación aislada antes de usar esta rama con tráfico.
+## Desplegar en RunPod
 
-## RunPod sin Global Volume
+- Imagen: `christiancollaguazo/imagine-video-worker:release-v1`.
+- GPU NVIDIA Blackwell SM120 y disco local de contenedor de al menos 100 GB.
+- Puerto HTTP `8000` únicamente. ComfyUI en `8188` no debe exponerse.
+- Deja vacío el comando de inicio para usar el entrypoint de la imagen.
+- Inyecta `IMAGINE_VIDEO_TOKEN` desde RunPod Secrets.
+- Para conservar modelos entre Pods, adjunta un Global Volume en
+  `/workspace-global`. Para una descarga local al disco del contenedor, usa el
+  modo `download` documentado en la tabla de variables.
 
-Usa `christiancollaguazo/imagine-video-worker:turbo-v4-download`, Container Disk de 100 GB,
-puerto HTTP 8000 y conserva el secreto del worker. Para esta modalidad, deja
-Global Volume sin adjuntar y configura:
+El primer arranque de un volumen nuevo requiere `IMAGINE_DOWNLOAD_MODELS=1` para
+poblar el volumen, lo que descarga aproximadamente 42 GB y verifica SHA-256.
+Solo una Pod debe poblarlo a la vez. En los arranques posteriores, el worker
+copia los pesos del volumen al disco local y los verifica. Sin el indicador de
+descarga, los archivos faltantes causan un error y no se recurre a Hugging Face.
+Configura `HF_TOKEN` como secreto si el repositorio de modelos exige acceso.
+
+## Variables de entorno
+
+Los valores de la columna “Predeterminado” corresponden al Dockerfile o al
+código actual. `IMAGINE_VIDEO_TOKEN` es obligatorio y no tiene default válido.
+Los valores booleanos se activan solo con el texto exacto `1`.
+
+| Variable | Predeterminado | Uso |
+|---|---|---|
+| `IMAGINE_VIDEO_TOKEN` | requerido | Token Bearer para todos los endpoints `/v1/`. Inyectarlo como secreto. |
+| `IMAGINE_MODEL_STORAGE_MODE` | `local` | `local` lee el Global Volume; `download` descarga al disco local y requiere también `IMAGINE_DOWNLOAD_MODELS=1`. |
+| `IMAGINE_DOWNLOAD_MODELS` | `0` | Con `1`, permite descargar los pesos fijados. En modo `local` también popula el volumen persistente. |
+| `IMAGINE_GLOBAL_MOUNT` | `/workspace-global` | Ruta del Global Volume en modo `local`. |
+| `HF_TOKEN` | vacío | Credencial opcional de Hugging Face para repositorios con acceso restringido. |
+| `IMAGINE_VIDEO_STEPS` | `16` | Pasos por defecto; entero entre 1 y 50. Una petición puede sobrescribirlo. |
+| `IMAGINE_VIDEO_FIRST_BLOCK_CACHE` | `safe` | `safe`, `fast` u `off`. `safe` usa `H3 Safe — 0.08 / max 2`; `fast` usa `H3 Fast — 0.10 / max 2`. |
+| `IMAGINE_SAGE_ATTENTION` | `on` (Dockerfile) | `on` exige SM120 y una prueba Sage correcta; `auto` permite fallback a PyTorch SDPA; `off` selecciona PyTorch SDPA. |
+| `IMAGINE_H3_AUDIO` | `1` (Dockerfile) | `1` genera audio; cualquier otro valor lo desactiva. |
+| `IMAGINE_H3_VRAM_PROFILE` | `auto` (Dockerfile) | Perfil de VRAM pasado al workflow H3. |
+| `IMAGINE_DEBUG_METRICS` | `0` (Dockerfile) | Con `1`, emite métricas técnicas de arranque y generación a stdout. |
+| `IMAGINE_VIDEO_JOB_TIMEOUT_SECONDS` | `5400` | Timeout de generación en segundos; valores menores se ajustan a 60. |
+| `IMAGINE_VIDEO_MAX_UPLOAD_BYTES` | `52428800` | Tamaño máximo de imagen subida: 50 MiB. |
+| `IMAGINE_VIDEO_MAX_LORA_UPLOAD_BYTES` | `4294967296` | Máximo de subida LoRA: 4 GiB. |
+| `COMFY_URL` | `http://127.0.0.1:8188` | URL HTTP interna de ComfyUI. |
+| `COMFY_WS` | derivada de `COMFY_URL` + `/ws` | URL WebSocket interna de ComfyUI. |
+| `IMAGINE_VIDEO_DATA` | `/tmp/imagine-video-worker` | Directorio transitorio para trabajos, imágenes y resultados. |
+
+El proceso de inicio fija `COMFY_ROOT`, `COMFY_INPUT_DIR`, `COMFY_OUTPUT_DIR`,
+`COMFY_TEMP_DIR` e `IMAGINE_VIDEO_DATA` en rutas de trabajo bajo `/tmp` o en
+`/opt/imagine-video-worker/ComfyUI`; no configures esos directorios para un
+volumen persistente. La API exige `duration_seconds` entre 3 y 30, sin valor
+predeterminado; la resolución por defecto es 672 (también 480, 576 y 768). Las opciones
+de petición disponibles están en el README principal.
+
+### Ejemplo: poblar Global Volume la primera vez
+
+```dotenv
+IMAGINE_VIDEO_TOKEN={{ RUNPOD_SECRET_imagine_video_token }}
+IMAGINE_MODEL_STORAGE_MODE=local
+IMAGINE_DOWNLOAD_MODELS=1
+IMAGINE_GLOBAL_MOUNT=/workspace-global
+HF_TOKEN={{ RUNPOD_SECRET_hf_token }}
+```
+
+Después de verificar que los archivos quedaron en el volumen, cambia
+`IMAGINE_DOWNLOAD_MODELS=0` en siguientes Pods. `HF_TOKEN` se puede retirar si
+ya no se necesitan descargas.
+
+### Ejemplo: descarga a disco local
 
 ```dotenv
 IMAGINE_VIDEO_TOKEN={{ RUNPOD_SECRET_imagine_video_token }}
 IMAGINE_MODEL_STORAGE_MODE=download
 IMAGINE_DOWNLOAD_MODELS=1
-IMAGINE_DEBUG_METRICS=1
+HF_TOKEN={{ RUNPOD_SECRET_hf_token }}
+IMAGINE_SAGE_ATTENTION=auto
 ```
 
-El arranque descarga los cinco archivos fijados (42.03 GB), comprueba tamaño y
-SHA-256 y solo entonces inicia ComfyUI. Los archivos válidos se reutilizan al
-reiniciar el mismo contenedor. Un Pod nuevo descarga de nuevo. El evento
-`model_staging_finished` registra `download_seconds`, `verification_seconds`
-y `bytes_downloaded`. La API admite duraciones enteras de 3 a 30 segundos.
-El rendimiento y la calidad de las duraciones extremas requieren pruebas en GPU.
+En este modo los aproximadamente 42 GB se vuelven a descargar para cada
+contenedor nuevo. En hardware distinto de SM120, establece
+`IMAGINE_SAGE_ATTENTION=auto` para permitir fallback, o `off` para usar SDPA.
 
-## Mac: build and publish once
+## Conectar Imagine
 
-Install and start Docker Desktop. Unzip this archive into the repository root.
-Replace `TU_USUARIO_DOCKERHUB` with your real Docker Hub username, and create a
-Docker Hub repository if needed. Only publish source you intend to share (or use
-a private repository and configure registry credentials in RunPod).
-
-```bash
-cd ~/Documents/projects/Imagine/imagine-video-worker
-unzip -o ~/Downloads/imagine-runpod-docker.zip -d .
-docker login
-docker buildx build --platform linux/amd64 \
-  -t TU_USUARIO_DOCKERHUB/imagine-video-worker:turbo-v4-download --push .
-```
-
-Docker Desktop on Apple Silicon builds amd64 via emulation. No NVIDIA GPU is
-required for build; inference must run on Linux with a compatible NVIDIA driver.
-The image contains no model weights or credentials. Build/push may be slow and
-requires local disk space; no GPU Pod is needed for the build.
-
-## RunPod: deploy
-
-- Custom image: `TU_USUARIO_DOCKERHUB/imagine-video-worker:turbo-v1`
-- 1 RTX PRO 6000 96 GB, Secure Cloud, in a region allowed by H3's license.
-- Container disk: 100 GB (local model staging and runtime/output headroom).
-- Global Volume: `imagine-turbo`, mount `/workspace-global`. If the UI uses
-  `/workspace`, set `IMAGINE_GLOBAL_MOUNT=/workspace` instead. Do not place the
-  runtime on this mount.
-- HTTP port 8000 only. No public ComfyUI or Jupyter port needed.
-- Leave Docker start command empty to use the image's entrypoint. Do not select
-  template options which override the startup command.
-- Environment: `IMAGINE_VIDEO_TOKEN` from a RunPod Secret (use the same token as
-  the Mac), `IMAGINE_GLOBAL_MOUNT=/workspace-global`,
-  `IMAGINE_DOWNLOAD_MODELS=1` for the first population only.
-- If the model repo requires authorization, provide an authorized HF_TOKEN via
-  a secret, and accept the applicable license before starting.
-
-The first boot downloads five manifest-pinned files (~42 GB), validates SHA-256
-and stores them in the Global Volume. Subsequent boots copy the weights onto
-local disk and verify them there before starting the existing services. Set
-`IMAGINE_DOWNLOAD_MODELS=0` for subsequent Pods to fail instead of fetching from
-Hugging Face if any weight is missing. Only one Pod may populate this volume
-at a time. If a write is interrupted and leaves a corrupt object, the next
-local staging detects it; remove only the identified corrupt object before
-retrying with downloads enabled. No prompts, images, logs or tokens are written
-into Global Volume by this integration. Do not delete the volume when terminating
-compute if you wish to keep the models.
-
-## Mac: connect Imagine
-
-Use the real Pod ID and same secret as RunPod in the existing Imagine `.env`:
+En el `.env` local de Imagine, guarda la URL HTTPS del proxy RunPod y el mismo
+token secreto:
 
 ```dotenv
-IMAGINE_VIDEO_URL=https://NUEVO-POD-ID-8000.proxy.runpod.net
-IMAGINE_VIDEO_TOKEN=TU_TOKEN_EXISTENTE
+IMAGINE_VIDEO_URL=https://<pod-id>-8000.proxy.runpod.net
+IMAGINE_VIDEO_TOKEN=<token-inyectado-en-RunPod>
 ```
 
-Then run:
-
-```bash
-cd ~/Documents/projects/Imagine && ./start_wardrobe_app.command
-```
-
-Select Turbo mode in Imagine. Test a 10-second video and monitor VRAM before
-trying longer clips. The public root may return 404; `/v1/health` is the correct
-endpoint with Bearer authentication.
-
-## Limitations and validation
-
-The image uses local staging instead of direct mmap on object-backed storage.
-Each fresh container must copy approximately 42 GB from Global Volume: startup
-is not instantaneous and GPU/IOPS charges apply. First download also takes time.
-Do not deploy multiple initial writers simultaneously. Global Volume billing
-and region support must be checked in RunPod. A zero balance can put stored
-data at risk; see current RunPod retention policies.
-
-Shell syntax, Python compilation and small local staging fixtures were checked.
-A real image build, RunPod mount, CUDA inference, and end-to-end generation have
-not been executed here. Inspect the first boot logs before sending a job.
+La salud se comprueba en `/v1/health` con Bearer token. El root puede devolver
+404. Nunca publiques el puerto 8188 ni guardes tokens dentro del repositorio.
