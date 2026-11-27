@@ -30,14 +30,13 @@ from .workflow import (
     DEFAULT_STEPS,
     DEFAULT_RESOLUTION,
     FIRST_BLOCK_CACHE_NODE,
-    FIRST_BLOCK_CACHE_PRESETS,
     SUPPORTED_DURATIONS,
     SUPPORTED_RESOLUTIONS,
     VIDEO_FPS,
     TURBO_LORA,
     build_workflow,
     canvas_for_image,
-    first_block_cache_mode,
+    first_block_cache_settings,
     sampling_steps,
 )
 
@@ -57,7 +56,7 @@ MAX_PIXELS = 40_000_000
 RETENTION_SECONDS = 15 * 60
 DEBUG_METRICS = os.environ.get("IMAGINE_DEBUG_METRICS", "0") == "1"
 AUDIO = os.environ.get("IMAGINE_H3_AUDIO", "1") == "1"
-FIRST_BLOCK_CACHE_MODE = first_block_cache_mode()
+FIRST_BLOCK_CACHE = first_block_cache_settings()
 ATTENTION_BACKEND_SELECTED = os.environ.get("IMAGINE_SELECTED_ATTENTION_BACKEND", "unverified")
 VRAM_PROFILE = os.environ.get("IMAGINE_H3_VRAM_PROFILE", "auto")
 VAE_OUTPUT = vae_output_mode()
@@ -68,6 +67,15 @@ def _metric(event: str, *, always: bool = False, **values):
     """Emit technical-only diagnostics; never include request or credential data."""
     if DEBUG_METRICS or always:
         print("imagine_metric " + json.dumps({"event": event, **values}, sort_keys=True), flush=True)
+
+
+def _first_block_cache_diagnostics():
+    return {
+        "first_block_cache_mode": FIRST_BLOCK_CACHE.mode,
+        "first_block_cache_preset": FIRST_BLOCK_CACHE.preset,
+        "first_block_cache_threshold": FIRST_BLOCK_CACHE.threshold,
+        "first_block_cache_max_consecutive_hits": FIRST_BLOCK_CACHE.max_consecutive_hits,
+    }
 
 
 def _report_export_metrics(node_output: dict, generation: int):
@@ -375,8 +383,7 @@ async def _run_job(job_id: str):
             vram_profile=VRAM_PROFILE, vae_output=VAE_OUTPUT,
             effective_width=job["effective_width"], effective_height=job["effective_height"],
             lora_name=job.get("lora_name"), lora_strength=job["lora_strength"], lora_stack=job["lora_stack"],
-            first_block_cache_mode=FIRST_BLOCK_CACHE_MODE,
-            first_block_cache_preset=FIRST_BLOCK_CACHE_PRESETS.get(FIRST_BLOCK_CACHE_MODE),
+            **_first_block_cache_diagnostics(),
         )
         job["status"], job["stage"], job["progress"] = "running", "uploading_photo", None
         try:
@@ -400,11 +407,11 @@ async def _run_job(job_id: str):
                 job["image_width"], job["image_height"], job["id"],
                 steps=job["steps"], audio=AUDIO, resolution=job["resolution"],
                 lora_name=job.get("lora_name"), lora_strength=job["lora_strength"], lora_stack=job["lora_stack"],
-                vae_output=VAE_OUTPUT,
+                first_block_cache=FIRST_BLOCK_CACHE, vae_output=VAE_OUTPUT,
             )
             for index in range(len(job["lora_stack"])):
                 node_labels[str(16 + index)] = f"lora_loader_{index + 1}"
-            if FIRST_BLOCK_CACHE_MODE != "off":
+            if FIRST_BLOCK_CACHE.mode != "off":
                 node_labels[str(16 + len(job["lora_stack"]))] = "first_block_cache"
             job.pop("prompt", None)
             client_id = new_client_id()
@@ -629,8 +636,7 @@ async def startup():
         "worker_startup", seconds=round(time.perf_counter() - startup_started, 3),
         vram_profile=VRAM_PROFILE, audio=AUDIO,
         attention_backend_selected=ATTENTION_BACKEND_SELECTED,
-        first_block_cache_mode=FIRST_BLOCK_CACHE_MODE,
-        first_block_cache_preset=FIRST_BLOCK_CACHE_PRESETS.get(FIRST_BLOCK_CACHE_MODE),
+        **_first_block_cache_diagnostics(),
     )
 
 
@@ -677,7 +683,7 @@ async def health(authorization: str | None = Header(None)):
         available_nodes = await comfy.health(audio=AUDIO)
     except Exception:
         raise HTTPException(503, "Worker is not ready") from None
-    if FIRST_BLOCK_CACHE_MODE != "off" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
+    if FIRST_BLOCK_CACHE.mode != "off" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
         raise HTTPException(503, "ComfyUI FirstBlockCache node is missing; install the pinned custom node or set IMAGINE_VIDEO_FIRST_BLOCK_CACHE=off")
     if VAE_OUTPUT == "gpu-buffer" and BUFFERED_VAE_NODE not in available_nodes:
         raise HTTPException(503, "ComfyUI H3 buffered VAE decode node is missing")
@@ -690,8 +696,8 @@ async def health(authorization: str | None = Header(None)):
         "attention_backend_selection": ATTENTION_BACKEND_SELECTED,
         "attention_policy": "Selected at worker startup; ComfyUI may choose different kernels per operation",
         "first_block_cache": {
-            "mode": FIRST_BLOCK_CACHE_MODE,
-            "preset": FIRST_BLOCK_CACHE_PRESETS.get(FIRST_BLOCK_CACHE_MODE),
+            "mode": FIRST_BLOCK_CACHE.mode,
+            "preset": FIRST_BLOCK_CACHE.preset,
         },
         "capabilities": {
             "image_to_video": True,
@@ -773,12 +779,12 @@ async def create_job(
         raise HTTPException(422, str(exc)) from None
     except (TypeError, json.JSONDecodeError):
         raise HTTPException(422, "lora_stack must be a JSON array") from None
-    if FIRST_BLOCK_CACHE_MODE != "off" or selected_stack:
+    if FIRST_BLOCK_CACHE.mode != "off" or selected_stack:
         try:
             available_nodes = await comfy.health(audio=AUDIO)
         except Exception:
             raise HTTPException(503, "ComfyUI is not ready") from None
-        if FIRST_BLOCK_CACHE_MODE != "off" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
+        if FIRST_BLOCK_CACHE.mode != "off" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
             raise HTTPException(503, "ComfyUI FirstBlockCache node is missing; install the pinned custom node or set IMAGINE_VIDEO_FIRST_BLOCK_CACHE=off")
         if selected_stack and "LoraLoaderModelOnly" not in available_nodes:
             raise HTTPException(503, "ComfyUI cannot load LoRAs")

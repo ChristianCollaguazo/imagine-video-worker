@@ -19,6 +19,7 @@ if [[ "$model_storage_mode" == "download" && "${IMAGINE_DOWNLOAD_MODELS:-0}" != 
 fi
 boot_started=$SECONDS
 export IMAGINE_VIDEO_RUN_ROOT=/tmp/imagine-video-worker
+.venv-comfy/bin/python -m app.workflow
 # Fail fast on incompatible GPU before copying large weights.
 .venv-comfy/bin/python -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable"; assert torch.cuda.is_bf16_supported(), "BF16 unavailable"; print(torch.cuda.get_device_name(0), flush=True)'
 if [[ "${IMAGINE_REQUIRE_NVENC:-0}" == "1" ]]; then

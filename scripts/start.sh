@@ -16,6 +16,7 @@ export COMFY_INPUT_DIR="$RUN_ROOT/comfy/input"
 export COMFY_OUTPUT_DIR="$RUN_ROOT/comfy/output"
 export COMFY_TEMP_DIR="$RUN_ROOT/comfy/temp"
 export IMAGINE_VIDEO_DATA="$RUN_ROOT/jobs"
+PYTHONPATH="$ROOT" "$ROOT/.venv-comfy/bin/python" -m app.workflow
 runtime_settings="$("$ROOT/.venv-comfy/bin/python" "$ROOT/h3_runtime.py")"
 read -r intra_threads _interop_threads _trace_prompt reserve_vram _vae_output <<< "$runtime_settings"
 comfy_args=()

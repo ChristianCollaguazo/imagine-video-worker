@@ -1,8 +1,10 @@
-# Imagine Video Worker — Docker release v3
+# Imagine Video Worker — Docker release v3.1
 
 Imagen de release para desplegar el worker privado en una Pod Linux con NVIDIA.
-La etiqueta de esta versión es `christiancollaguazo/imagine-video-worker:release-v3`.
-Consulta la [guía de inferencia H3](README-H3-release-v3.md) para métricas, pruebas en RunPod y rollback a `release-v2`.
+La etiqueta prevista es `christiancollaguazo/imagine-video-worker:release-v3.1`.
+Release v3.1 añade el modo manual de FirstBlockCache sobre `release-v3`. La configuración inicial recomendada para validar en RunPod es un umbral de `0.15` con un máximo de dos aciertos consecutivos. Para volver a la configuración de caché predeterminada, usa `safe`. Las instrucciones de benchmark de referencia siguen en la [guía de inferencia H3 de release-v3](README-H3-release-v3.md).
+
+La suite local pasó 51 pruebas, incluidas cinco regresiones para los valores manuales, validación de arranque, workflow, diagnósticos y compatibilidad con los presets. El esquema OpenAPI y 24 variantes de los workflows existentes coincidieron con `release-v3`. El rendimiento y la calidad visual se validarán en RunPod.
 El `Dockerfile` parte de la imagen validada `turbo-v1`, conserva los pesos H3
 fijados por manifiesto fuera de la imagen y añade el worker, FirstBlockCache y
 SageAttention. La imagen requiere GPU SM120 (Blackwell) con la rueda SageAttention
@@ -16,7 +18,7 @@ Desde la raíz del repositorio, con los cambios de release confirmados en Git, D
 docker login
 docker buildx build --platform linux/amd64 \
   --build-arg IMAGINE_SOURCE_COMMIT="$(git rev-parse HEAD)" \
-  -t christiancollaguazo/imagine-video-worker:release-v3 --push .
+  -t christiancollaguazo/imagine-video-worker:release-v3.1 --push .
 ```
 
 Para construir y cargar localmente en vez de publicar, sustituye `--push` por
@@ -31,7 +33,7 @@ los codificadores de PyAV. La prueba NVENC se ejecuta con una GPU NVIDIA.
 
 ## Desplegar en RunPod
 
-- Imagen: `christiancollaguazo/imagine-video-worker:release-v3`.
+- Imagen: `christiancollaguazo/imagine-video-worker:release-v3.1`.
 - GPU NVIDIA Blackwell SM120 y disco local de contenedor de al menos 100 GB.
 - Puerto HTTP `8000` únicamente. ComfyUI en `8188` no debe exponerse.
 - Deja vacío el comando de inicio para usar el entrypoint de la imagen.
@@ -62,7 +64,7 @@ arrancar el worker ni preparar los pesos:
 ```bash
 docker run --rm --gpus all \
   --entrypoint /opt/imagine-video-worker/.venv-comfy/bin/python \
-  christiancollaguazo/imagine-video-worker:release-v3 \
+  christiancollaguazo/imagine-video-worker:release-v3.1 \
   /opt/imagine-video-worker/scripts/preflight_export.py
 ```
 
@@ -80,7 +82,9 @@ Los valores booleanos se activan solo con el texto exacto `1`.
 | `IMAGINE_GLOBAL_MOUNT` | `/workspace-global` | Ruta del Global Volume en modo `local`. |
 | `HF_TOKEN` | vacío | Credencial opcional de Hugging Face para repositorios con acceso restringido. |
 | `IMAGINE_VIDEO_STEPS` | `16` | Pasos por defecto; entero entre 1 y 50. Una petición puede sobrescribirlo. |
-| `IMAGINE_VIDEO_FIRST_BLOCK_CACHE` | `safe` | `safe`, `fast` u `off`. `safe` usa `H3 Safe — 0.08 / max 2`; `fast` usa `H3 Fast — 0.10 / max 2`. |
+| `IMAGINE_VIDEO_FIRST_BLOCK_CACHE` | `safe` | `safe` (0.08, máximo 2), `fast` (0.10, máximo 2), `off` o `custom`. |
+| `IMAGINE_VIDEO_FIRST_BLOCK_CACHE_THRESHOLD` | sin valor | Umbral finito entre 0 y 1, inclusive. Obligatorio en modo `custom`. |
+| `IMAGINE_VIDEO_FIRST_BLOCK_CACHE_MAX_HITS` | sin valor | Máximo de aciertos consecutivos. Entero entre 1 y 20, obligatorio en modo `custom`. |
 | `IMAGINE_SAGE_ATTENTION` | `on` (Dockerfile) | `on` exige SM120 y una prueba Sage correcta; `auto` permite fallback a PyTorch SDPA; `off` selecciona PyTorch SDPA. |
 | `IMAGINE_H3_AUDIO` | `1` (Dockerfile) | `1` genera una pista de audio y `0` omite su decodificación y exportación. |
 | `IMAGINE_REQUIRE_NVENC` | `0` | Con `1`, exige una prueba de codificación NVENC antes de preparar los pesos. |
@@ -120,19 +124,41 @@ Después de verificar que los archivos quedaron en el volumen, cambia
 `IMAGINE_DOWNLOAD_MODELS=0` en siguientes Pods. `HF_TOKEN` se puede retirar si
 ya no se necesitan descargas.
 
-### Ejemplo: descarga a disco local
+### RunPod en Blackwell de 96 GB con descarga a disco local
 
 ```dotenv
 IMAGINE_VIDEO_TOKEN={{ RUNPOD_SECRET_imagine_video_token }}
 IMAGINE_MODEL_STORAGE_MODE=download
 IMAGINE_DOWNLOAD_MODELS=1
 HF_TOKEN={{ RUNPOD_SECRET_hf_token }}
-IMAGINE_SAGE_ATTENTION=auto
+NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+IMAGINE_VIDEO_STEPS=8
+IMAGINE_H3_AUDIO=0
+IMAGINE_SAGE_ATTENTION=on
+IMAGINE_H3_VRAM_PROFILE=high
+IMAGINE_H3_RESERVE_VRAM_GIB=12
+IMAGINE_H3_VAE_OUTPUT=gpu-buffer
+IMAGINE_H3_INTRAOP_THREADS=auto
+IMAGINE_H3_INTEROP_THREADS=auto
+IMAGINE_REQUIRE_NVENC=1
+IMAGINE_VIDEO_FIRST_BLOCK_CACHE=custom
+IMAGINE_VIDEO_FIRST_BLOCK_CACHE_THRESHOLD=0.15
+IMAGINE_VIDEO_FIRST_BLOCK_CACHE_MAX_HITS=2
+IMAGINE_DEBUG_METRICS=1
+IMAGINE_H3_CUDA_TRACE_PROMPT=0
+IMAGINE_H3_BENCHMARK_MODE=0
 ```
 
-En este modo los aproximadamente 42 GB se vuelven a descargar para cada
-contenedor nuevo. En hardware distinto de SM120, establece
-`IMAGINE_SAGE_ATTENTION=auto` para permitir fallback, o `off` para usar SDPA.
+Esta configuración usa el disco del contenedor y la descarga de unos 42 GB por
+contenedor nuevo. Deja el Global Volume sin adjuntar y el comando de inicio
+vacío. `HF_TOKEN` solo es necesario si Hugging Face requiere credenciales. Las
+LoRA personalizadas se cargan por separado. La expulsión de fotogramas
+decodificados se aplica automáticamente.
+
+Con las métricas activadas, `worker_startup` y `generation_started` registran
+`first_block_cache_threshold` y `first_block_cache_max_consecutive_hits`.
+`h3_inference` conserva los aciertos de caché, los bloques omitidos, las
+diferencias residuales y los tiempos de difusión.
 
 ## Benchmark aislado de exportación
 

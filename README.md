@@ -2,7 +2,7 @@
 
 Servicio privado de una sola cola para convertir **una imagen inicial y un prompt** en un MP4 de 3 a 30 segundos. Base y Turbo reutilizan un único stack oficial H3 cuantizado: difusión FL2VA INT8 ConvRot, encoder Qwen3VL NVFP4-AWQ y VAE de video INT8. Base no usa LoRA; Turbo aplica la LoRA Lightning oficial de 8 pasos si está instalada. Turbo es un experimento; la calidad no está garantizada y la guía oficial advierte que puede suavizar el movimiento y el audio. La cuantización y Turbo tampoco cuentan con una evaluación de calidad en este worker. Este worker se ejecuta desde el repositorio privado o desde la imagen documentada en [README-Docker.md](README-Docker.md).
 
-Consulta la [guía de inferencia H3 release-v3](README-H3-release-v3.md) para la investigación, las variables nuevas y el benchmark en RunPod.
+Para desplegar el worker y consultar el benchmark de referencia, usa la [configuración RunPod de release-v3.1](README-Docker.md#runpod-en-blackwell-de-96-gb-con-descarga-a-disco-local) y la [guía de inferencia H3 release-v3](README-H3-release-v3.md).
 
 ## Estado y alcance
 
@@ -42,7 +42,7 @@ H3 acepta longitudes en la cuadrícula `17k + 5` cuadros a 24 fps. Para satisfac
 
 La resolución predeterminada usa un lado corto de 672; también se admiten 480, 576 y 768. Todos los lados son múltiplos de 32 y quedan dentro del canvas nativo máximo de 1344 × 768 (apaisado) o 768 × 1344 (vertical). `GET /v1/health` anuncia las cuatro resoluciones. El nodo nativo estira el primer cuadro para llenar el canvas; fotos muy panorámicas, muy altas o de otra relación de aspecto pueden deformarse. Recorta la imagen de origen a la relación de aspecto de salida si quieres conservar proporciones.
 
-FirstBlockCache usa el preset `H3 Safe — 0.08 / max 2` por defecto. Configura `IMAGINE_VIDEO_FIRST_BLOCK_CACHE=fast` para `H3 Fast — 0.10 / max 2`, o `off` para desactivarlo. El valor efectivo y el preset aparecen en `/v1/health` y en las métricas `worker_startup` y `generation_started`. El nodo está fijado en el commit `d474755360cc1784df1b7c933ca28195e55e3445`, que incluye estos presets.
+FirstBlockCache usa el preset `H3 Safe — 0.08 / max 2` por defecto. Configura `IMAGINE_VIDEO_FIRST_BLOCK_CACHE=fast` para `H3 Fast — 0.10 / max 2`, `off` para desactivarlo o `custom` para usar los dos valores manuales de la tabla. Solo el modo `custom` lee y valida esos valores al arrancar. El modo y el preset aparecen en `/v1/health`. Las métricas `worker_startup` y `generation_started` también incluyen el umbral y el máximo efectivos. El nodo está fijado en el commit `d474755360cc1784df1b7c933ca28195e55e3445`.
 
 El worker usa **16 pasos por defecto**. Para cambiar el valor predeterminado, configura `IMAGINE_VIDEO_STEPS` antes de iniciarlo; cada petición también puede incluir el campo multipart opcional `steps`. Se admiten enteros de 1 a 50 en ambos modos, Base y Turbo. La respuesta del trabajo incluye la selección y `GET /v1/health` anuncia los pasos admitidos.
 
@@ -102,7 +102,7 @@ El apagado pide terminación normal al worker y a ComfyUI. Al volver a iniciar, 
 
 ### Variables de entorno
 
-El contenedor `release-v3` fija algunos valores en el Dockerfile. Los valores
+El contenedor `release-v3.1` fija algunos valores en el Dockerfile. Los valores
 entre paréntesis son los defaults del código cuando se ejecuta fuera de esa
 imagen. `IMAGINE_VIDEO_TOKEN` siempre es obligatorio al iniciar el worker.
 
@@ -114,7 +114,9 @@ imagen. `IMAGINE_VIDEO_TOKEN` siempre es obligatorio al iniciar el worker.
 | `IMAGINE_GLOBAL_MOUNT` | `/workspace-global` | Punto de montaje persistente para el modo `local`. |
 | `HF_TOKEN` | vacío | Token opcional para descargas restringidas de Hugging Face. |
 | `IMAGINE_VIDEO_STEPS` | `16` | Pasos por defecto, de 1 a 50; una solicitud puede sobrescribirlo. |
-| `IMAGINE_VIDEO_FIRST_BLOCK_CACHE` | `safe` | `safe`, `fast` u `off`; por defecto preset `H3 Safe — 0.08 / max 2`. |
+| `IMAGINE_VIDEO_FIRST_BLOCK_CACHE` | `safe` | `safe`, `fast`, `off` o `custom`. |
+| `IMAGINE_VIDEO_FIRST_BLOCK_CACHE_THRESHOLD` | sin valor | Umbral finito de 0 a 1 inclusive, obligatorio en modo `custom`. |
+| `IMAGINE_VIDEO_FIRST_BLOCK_CACHE_MAX_HITS` | sin valor | Máximo de aciertos consecutivos, entero de 1 a 20, obligatorio en modo `custom`. |
 | `IMAGINE_SAGE_ATTENTION` | `on` en Docker (`auto` en código) | `on` requiere SM120; `auto` permite fallback; `off` usa PyTorch SDPA. |
 | `IMAGINE_H3_AUDIO` | `1` | Solo el texto exacto `1` habilita audio. |
 | `IMAGINE_H3_VRAM_PROFILE` | `auto` | Perfil de VRAM de ComfyUI H3. |

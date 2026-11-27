@@ -2,6 +2,8 @@
 
 Baseline is the `release-v2` tag at `95dc1314abef74aadecdced9c94a3da622aade83`. The target image is `christiancollaguazo/imagine-video-worker:release-v3`. Keep the `release-v2` image and tag for rollback.
 
+For the custom FirstBlockCache rollout, see the [release-v3.1 RunPod configuration](README-Docker.md#runpod-en-blackwell-de-96-gb-con-descarga-a-disco-local).
+
 ## Evidence and investigation priorities
 
 The supplied Blackwell runs used a 96 GB RTX PRO 6000, 10 seconds, 672×1184, 24 FPS, eight steps, three LoRAs and silent output. The two warm jobs averaged 115.94 s. Diffusion averaged 93.77 s, VAE decode 18.42 s and export 1.88 s. The third run's first step took 9.672 s and its remaining seven took 11.603–11.704 s. Relative to the warm baseline, the targets of 60 s diffusion, 12 s VAE and 80 s total call for roughly 36%, 35% and 31% reductions, respectively. Hardware results for v3 are pending.
@@ -140,4 +142,4 @@ The Apple Silicon regression suite passed 46 tests, including the default silent
 
 For silent production keep `IMAGINE_H3_AUDIO=0`, `IMAGINE_SAGE_ATTENTION=on`, `IMAGINE_H3_VRAM_PROFILE=auto`, `IMAGINE_VIDEO_FIRST_BLOCK_CACHE=safe`, `IMAGINE_H3_VAE_OUTPUT=cpu`, default thread pools, and `IMAGINE_REQUIRE_NVENC=1`. Keep debug metrics, CUDA trace and benchmark mode off in routine production. Preserve the deployment's selected inference steps. Promote measured settings individually after output and stability checks. Test a long job and a different LoRA stack before promoting changes to VRAM residency or VAE buffering. Longer durations grow the output buffer, and changing LoRA stacks can change weight residency and patch cost.
 
-To roll back, redeploy `christiancollaguazo/imagine-video-worker:release-v2` with the same staged weights, secrets, audio configuration and NVENC preflight. The source reference for rollback is `release-v2` at `95dc1314abef74aadecdced9c94a3da622aade83`. See [Docker release instructions](README-Docker.md) for the release-v3 build command.
+To roll back, redeploy `christiancollaguazo/imagine-video-worker:release-v2` with the same staged weights, secrets, audio configuration and NVENC preflight. The source reference for rollback is `release-v2` at `95dc1314abef74aadecdced9c94a3da622aade83`. The `release-v3` branch contains the corresponding Docker build instructions.

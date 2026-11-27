@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from h3_runtime import vae_output_mode
@@ -26,11 +27,20 @@ DEFAULT_RESOLUTION = 672
 FIRST_BLOCK_CACHE_NODE = "ApplyMiniMaxH3FirstBlockCache"
 FIRST_BLOCK_CACHE_SAFE_PRESET = "H3 Safe — 0.08 / max 2"
 FIRST_BLOCK_CACHE_FAST_PRESET = "H3 Fast — 0.10 / max 2"
+FIRST_BLOCK_CACHE_CUSTOM_MODE = "Custom — manual values"
 FIRST_BLOCK_CACHE_PRESETS = {
     "safe": FIRST_BLOCK_CACHE_SAFE_PRESET,
     "fast": FIRST_BLOCK_CACHE_FAST_PRESET,
 }
-FIRST_BLOCK_CACHE_MODES = ("fast", "safe", "off")
+FIRST_BLOCK_CACHE_MODES = ("fast", "safe", "off", "custom")
+
+
+@dataclass(frozen=True)
+class FirstBlockCacheSettings:
+    mode: str
+    preset: str | None
+    threshold: float | None
+    max_consecutive_hits: int | None
 
 
 def first_block_cache_mode(configured: str | None = None) -> str:
@@ -38,8 +48,34 @@ def first_block_cache_mode(configured: str | None = None) -> str:
     raw = os.environ.get("IMAGINE_VIDEO_FIRST_BLOCK_CACHE", "safe") if configured is None else configured
     mode = str(raw).strip().lower()
     if mode not in FIRST_BLOCK_CACHE_MODES:
-        raise ValueError("IMAGINE_VIDEO_FIRST_BLOCK_CACHE must be 'fast', 'safe', or 'off'")
+        raise ValueError("IMAGINE_VIDEO_FIRST_BLOCK_CACHE must be 'fast', 'safe', 'off', or 'custom'")
     return mode
+
+
+def first_block_cache_settings(configured: str | None = None) -> FirstBlockCacheSettings:
+    mode = first_block_cache_mode(configured)
+    if mode == "off":
+        return FirstBlockCacheSettings(mode, None, None, None)
+    if mode != "custom":
+        threshold = 0.10 if mode == "fast" else 0.08
+        return FirstBlockCacheSettings(mode, FIRST_BLOCK_CACHE_PRESETS[mode], threshold, 2)
+
+    threshold_error = "IMAGINE_VIDEO_FIRST_BLOCK_CACHE_THRESHOLD must be a finite number from 0 to 1 in custom mode"
+    try:
+        threshold = float(os.environ.get("IMAGINE_VIDEO_FIRST_BLOCK_CACHE_THRESHOLD", ""))
+    except ValueError:
+        raise ValueError(threshold_error) from None
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(threshold_error)
+
+    max_hits_error = "IMAGINE_VIDEO_FIRST_BLOCK_CACHE_MAX_HITS must be an integer from 1 to 20 in custom mode"
+    try:
+        max_hits = int(os.environ.get("IMAGINE_VIDEO_FIRST_BLOCK_CACHE_MAX_HITS", ""))
+    except ValueError:
+        raise ValueError(max_hits_error) from None
+    if not 1 <= max_hits <= 20:
+        raise ValueError(max_hits_error)
+    return FirstBlockCacheSettings(mode, None, threshold, max_hits)
 
 
 def sampling_steps(configured: int | None = None, *, default: int = DEFAULT_STEPS) -> int:
@@ -110,7 +146,7 @@ def build_workflow(
     lora_name: str | None = None,
     lora_strength: float = 1.0,
     lora_stack: list[dict] | None = None,
-    first_block_cache: str | None = None,
+    first_block_cache: str | FirstBlockCacheSettings | None = None,
     vae_output: str | None = None,
 ) -> dict:
     """Build the ComfyUI API prompt graph for one image plus one prompt."""
@@ -161,18 +197,21 @@ def build_workflow(
     if stack:
         graph["7"]["inputs"]["model"] = previous_model
         graph["10"]["inputs"]["model"] = previous_model
-    cache_mode = first_block_cache_mode(first_block_cache)
-    if cache_mode != "off":
+    cache = (
+        first_block_cache if isinstance(first_block_cache, FirstBlockCacheSettings)
+        else first_block_cache_settings(first_block_cache)
+    )
+    if cache.mode != "off":
         cache_node_id = str(16 + len(stack))
         graph[cache_node_id] = {
             "class_type": FIRST_BLOCK_CACHE_NODE,
             "inputs": {
                 "model": previous_model,
-                "mode": FIRST_BLOCK_CACHE_PRESETS[cache_mode],
-                "threshold": 0.10 if cache_mode == "fast" else 0.08,
+                "mode": cache.preset or FIRST_BLOCK_CACHE_CUSTOM_MODE,
+                "threshold": cache.threshold,
                 "start_percent": 0.10,
                 "end_percent": 0.95,
-                "max_consecutive_hits": 2,
+                "max_consecutive_hits": cache.max_consecutive_hits,
                 "temporal_guard": False,
             },
         }
@@ -210,3 +249,10 @@ def build_turbo_workflow(
         first_block_cache=first_block_cache,
     )
     return graph
+
+
+if __name__ == "__main__":
+    try:
+        first_block_cache_settings()
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
