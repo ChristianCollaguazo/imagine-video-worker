@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd /opt/imagine-video-worker
-: "${IMAGINE_VIDEO_TOKEN:?Configure IMAGINE_VIDEO_TOKEN in RunPod Secrets}"
+benchmark_mode="${IMAGINE_H3_BENCHMARK_MODE:-0}"
+case "$benchmark_mode" in
+  0) : "${IMAGINE_VIDEO_TOKEN:?Configure IMAGINE_VIDEO_TOKEN in RunPod Secrets}" ;;
+  1) ;;
+  *) echo "IMAGINE_H3_BENCHMARK_MODE must be 0 or 1" >&2; exit 1 ;;
+esac
 export IMAGINE_VIDEO_TOKEN
 model_storage_mode="${IMAGINE_MODEL_STORAGE_MODE:-local}"
 case "$model_storage_mode" in
@@ -36,6 +41,11 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
+if [[ "$benchmark_mode" == "1" ]]; then
+  echo "Model staging completed. Benchmark mode is ready for loopback ComfyUI."
+  sleep infinity & wait $!
+  exit
+fi
 bash scripts/start.sh
 if [[ "${IMAGINE_DEBUG_METRICS:-0}" == "1" ]]; then
   printf 'imagine_metric {"event":"container_ready","seconds":%s}\n' "$((SECONDS-boot_started))"

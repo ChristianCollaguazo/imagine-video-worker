@@ -5,6 +5,9 @@
 !config/**
 !custom_nodes/
 !custom_nodes/imagine_h3_export.py
+!custom_nodes/imagine_h3_runtime.py
+!h3_runtime.py
+!h3_diagnostics.py
 !video_export.py
 !scripts/
 !scripts/**

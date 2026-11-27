@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+comfy_only=0
+case "${1:-}" in
+  "") ;;
+  --comfy-only) comfy_only=1 ;;
+  *) echo "Usage: scripts/start.sh [--comfy-only]" >&2; exit 1 ;;
+esac
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUN_ROOT="${IMAGINE_VIDEO_RUN_ROOT:-/tmp/imagine-video-worker}"
 [[ "$RUN_ROOT" == /tmp/* ]] || { echo "IMAGINE_VIDEO_RUN_ROOT must stay under /tmp" >&2; exit 1; }
@@ -9,15 +16,14 @@ export COMFY_INPUT_DIR="$RUN_ROOT/comfy/input"
 export COMFY_OUTPUT_DIR="$RUN_ROOT/comfy/output"
 export COMFY_TEMP_DIR="$RUN_ROOT/comfy/temp"
 export IMAGINE_VIDEO_DATA="$RUN_ROOT/jobs"
+runtime_settings="$("$ROOT/.venv-comfy/bin/python" "$ROOT/h3_runtime.py")"
+read -r intra_threads _interop_threads _trace_prompt reserve_vram _vae_output <<< "$runtime_settings"
 comfy_args=()
-case "${IMAGINE_H3_VRAM_PROFILE:-auto}" in
-  auto) ;;
-  high)
-    "${ROOT}/.venv-comfy/bin/python" -c 'import torch; assert torch.cuda.get_device_properties(0).total_memory >= 90 * 1024**3, "High VRAM profile requires at least 90 GiB VRAM"'
-    comfy_args+=(--highvram --reserve-vram 12)
-    ;;
-  *) echo "IMAGINE_H3_VRAM_PROFILE must be auto or high" >&2; exit 1 ;;
-esac
+if [[ "${IMAGINE_H3_VRAM_PROFILE:-auto}" == "high" ]]; then
+  "${ROOT}/.venv-comfy/bin/python" -c 'import torch; assert torch.cuda.get_device_properties(0).total_memory >= 90 * 1024**3, "High VRAM profile requires at least 90 GiB VRAM"'
+  comfy_args+=(--highvram)
+fi
+if [[ "$reserve_vram" != "-" ]]; then comfy_args+=(--reserve-vram "$reserve_vram"); fi
 case "${IMAGINE_H3_AUDIO:-1}" in
   0|1) ;;
   *) echo "IMAGINE_H3_AUDIO must be 0 or 1" >&2; exit 1 ;;
@@ -27,7 +33,9 @@ case "${IMAGINE_SAGE_ATTENTION:-on}" in
   *) echo "IMAGINE_SAGE_ATTENTION must be auto, on, or off" >&2; exit 1 ;;
 esac
 
-: "${IMAGINE_VIDEO_TOKEN:?Set IMAGINE_VIDEO_TOKEN in the process environment}"
+if [[ "$comfy_only" == "0" ]]; then
+  : "${IMAGINE_VIDEO_TOKEN:?Set IMAGINE_VIDEO_TOKEN in the process environment}"
+fi
 command -v ffprobe >/dev/null || { echo "ffprobe is required" >&2; exit 1; }
 "$ROOT/.venv-comfy/bin/python" -c 'import torch, torchaudio; assert torch.cuda.is_available(), "CUDA is unavailable to PyTorch"; assert torch.cuda.is_bf16_supported(), "GPU does not report BF16 support"'
 attention_status="$(PYTHONPATH="$ROOT" "$ROOT/.venv-comfy/bin/python" -m app.attention_backend)"
@@ -103,6 +111,9 @@ log_comfy() {
   done
 }
 run_comfy() {
+  if [[ "$intra_threads" != "0" ]]; then
+    export OMP_NUM_THREADS="$intra_threads" MKL_NUM_THREADS="$intra_threads"
+  fi
   PYTHONPATH="$ROOT" exec "$ROOT/.venv-comfy/bin/python" "$COMFY_ROOT/main.py" \
     --base-directory "$COMFY_ROOT" "${comfy_args[@]}" \
     --extra-model-paths-config "$ROOT/config/comfy-paths.yaml" \
@@ -127,8 +138,19 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 if [[ "$healthy" -ne 1 ]]; then echo "ComfyUI did not become healthy" >&2; exit 1; fi
+if ! curl --silent --fail http://127.0.0.1:8188/object_info/ImagineH3BufferedVAEDecode |
+  "$ROOT/.venv-comfy/bin/python" -c 'import json, sys; sys.exit("ImagineH3BufferedVAEDecode" not in json.load(sys.stdin))' 2>/dev/null; then
+  echo "H3 runtime node did not load. Check thread settings and the pinned ComfyUI runtime." >&2
+  exit 1
+fi
 if [[ "${IMAGINE_DEBUG_METRICS:-0}" == "1" ]]; then
   printf 'imagine_metric {"event":"comfy_available","seconds":%s}\n' "$((SECONDS-comfy_start_started))"
+fi
+
+if [[ "$comfy_only" == "1" ]]; then
+  trap - EXIT
+  echo "Benchmark ComfyUI ready on loopback port 8188."
+  exit 0
 fi
 
 # Provider ingress must terminate TLS and expose only this service on HTTPS port 8000.

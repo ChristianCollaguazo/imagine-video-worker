@@ -1,7 +1,8 @@
-# Imagine Video Worker — Docker release v2
+# Imagine Video Worker — Docker release v3
 
 Imagen de release para desplegar el worker privado en una Pod Linux con NVIDIA.
-La etiqueta de esta versión es `christiancollaguazo/imagine-video-worker:release-v2`.
+La etiqueta de esta versión es `christiancollaguazo/imagine-video-worker:release-v3`.
+Consulta la [guía de inferencia H3](README-H3-release-v3.md) para métricas, pruebas en RunPod y rollback a `release-v2`.
 El `Dockerfile` parte de la imagen validada `turbo-v1`, conserva los pesos H3
 fijados por manifiesto fuera de la imagen y añade el worker, FirstBlockCache y
 SageAttention. La imagen requiere GPU SM120 (Blackwell) con la rueda SageAttention
@@ -9,13 +10,13 @@ incluida; consulta `IMAGINE_SAGE_ATTENTION` para elegir explícitamente otro bac
 
 ## Construir y publicar
 
-Desde la raíz del repositorio, con Docker Desktop iniciado y sesión en Docker Hub:
+Desde la raíz del repositorio, con los cambios de release confirmados en Git, Docker Desktop iniciado y sesión en Docker Hub:
 
 ```bash
 docker login
 docker buildx build --platform linux/amd64 \
   --build-arg IMAGINE_SOURCE_COMMIT="$(git rev-parse HEAD)" \
-  -t christiancollaguazo/imagine-video-worker:release-v2 --push .
+  -t christiancollaguazo/imagine-video-worker:release-v3 --push .
 ```
 
 Para construir y cargar localmente en vez de publicar, sustituye `--push` por
@@ -30,7 +31,7 @@ los codificadores de PyAV. La prueba NVENC se ejecuta con una GPU NVIDIA.
 
 ## Desplegar en RunPod
 
-- Imagen: `christiancollaguazo/imagine-video-worker:release-v2`.
+- Imagen: `christiancollaguazo/imagine-video-worker:release-v3`.
 - GPU NVIDIA Blackwell SM120 y disco local de contenedor de al menos 100 GB.
 - Puerto HTTP `8000` únicamente. ComfyUI en `8188` no debe exponerse.
 - Deja vacío el comando de inicio para usar el entrypoint de la imagen.
@@ -61,7 +62,7 @@ arrancar el worker ni preparar los pesos:
 ```bash
 docker run --rm --gpus all \
   --entrypoint /opt/imagine-video-worker/.venv-comfy/bin/python \
-  christiancollaguazo/imagine-video-worker:release-v2 \
+  christiancollaguazo/imagine-video-worker:release-v3 \
   /opt/imagine-video-worker/scripts/preflight_export.py
 ```
 
@@ -83,7 +84,13 @@ Los valores booleanos se activan solo con el texto exacto `1`.
 | `IMAGINE_SAGE_ATTENTION` | `on` (Dockerfile) | `on` exige SM120 y una prueba Sage correcta; `auto` permite fallback a PyTorch SDPA; `off` selecciona PyTorch SDPA. |
 | `IMAGINE_H3_AUDIO` | `1` (Dockerfile) | `1` genera una pista de audio y `0` omite su decodificación y exportación. |
 | `IMAGINE_REQUIRE_NVENC` | `0` | Con `1`, exige una prueba de codificación NVENC antes de preparar los pesos. |
-| `IMAGINE_H3_VRAM_PROFILE` | `auto` (Dockerfile) | Perfil de VRAM pasado al workflow H3. |
+| `IMAGINE_H3_VRAM_PROFILE` | `auto` (Dockerfile) | Perfil de VRAM de ComfyUI. `high` requiere 90 GiB y reserva 12 GiB de forma predeterminada. |
+| `IMAGINE_H3_RESERVE_VRAM_GIB` | vacío | Sobrescribe la reserva de VRAM de ComfyUI en GiB. |
+| `IMAGINE_H3_INTRAOP_THREADS` | `0` | Hilos intra-op de PyTorch, OpenMP y MKL en ComfyUI. Acepta `auto` y enteros positivos. |
+| `IMAGINE_H3_INTEROP_THREADS` | `0` | Hilos inter-op de PyTorch en ComfyUI. Acepta `auto` y enteros positivos. |
+| `IMAGINE_H3_VAE_OUTPUT` | `cpu` | `gpu-buffer` prueba un buffer CUDA para la decodificación de video H3. |
+| `IMAGINE_H3_CUDA_TRACE_PROMPT` | `0` | Con métricas activadas, captura CUDA para el trabajo con este ordinal. |
+| `IMAGINE_H3_BENCHMARK_MODE` | `0` | `1` prepara los pesos y permite iniciar ComfyUI localmente para medir sin exponer la API. |
 | `IMAGINE_DEBUG_METRICS` | `0` (Dockerfile) | Con `1`, emite métricas técnicas de arranque y generación a stdout. |
 | `IMAGINE_VIDEO_JOB_TIMEOUT_SECONDS` | `5400` | Timeout de generación en segundos; valores menores se ajustan a 60. |
 | `IMAGINE_VIDEO_MAX_UPLOAD_BYTES` | `52428800` | Tamaño máximo de imagen subida: 50 MiB. |
@@ -130,7 +137,7 @@ contenedor nuevo. En hardware distinto de SM120, establece
 ## Benchmark aislado de exportación
 
 En una Pod existente con el runtime instalado, ejecuta estos comandos desde el
-checkout actualizado del worker. En una imagen `release-v2`, usa
+checkout actualizado del worker. En una imagen de release, usa
 `cd /opt/imagine-video-worker`. El script solo carga PyTorch, PyAV y los
 fotogramas de prueba. El script puede ejecutarse con los servicios detenidos y
 no descarga pesos ni requiere el token de la API.

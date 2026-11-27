@@ -20,9 +20,13 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from h3_diagnostics import HISTORY_KEY, STAGES as COMFY_NODE_LABELS
+from h3_runtime import vae_output_mode
+
 from .comfy import ComfyClient, ModelLoaderError, new_client_id
 from .lora_catalog import available_lora_names, resolve_lora_name, resolve_lora_stack
 from .workflow import (
+    BUFFERED_VAE_NODE,
     DEFAULT_STEPS,
     DEFAULT_RESOLUTION,
     FIRST_BLOCK_CACHE_NODE,
@@ -55,13 +59,8 @@ DEBUG_METRICS = os.environ.get("IMAGINE_DEBUG_METRICS", "0") == "1"
 AUDIO = os.environ.get("IMAGINE_H3_AUDIO", "1") == "1"
 FIRST_BLOCK_CACHE_MODE = first_block_cache_mode()
 ATTENTION_BACKEND_SELECTED = os.environ.get("IMAGINE_SELECTED_ATTENTION_BACKEND", "unverified")
-COMFY_NODE_LABELS = {
-    "1": "diffusion_model_loader", "2": "text_encoder_loader",
-    "3": "video_vae_loader", "4": "audio_vae_loader", "5": "image_load",
-    "6": "prompt_and_image_encode", "11": "diffusion", "12": "video_vae_decode",
-    "13": "audio_decode", "15": "mp4_export",
-}
 VRAM_PROFILE = os.environ.get("IMAGINE_H3_VRAM_PROFILE", "auto")
+VAE_OUTPUT = vae_output_mode()
 _generation_count = 0
 
 
@@ -159,7 +158,7 @@ async def _validate_video(path, frame_count, duration, expect_audio, width, heig
 
 
 async def _sample_gpu_peak(stop: asyncio.Event, peaks: dict[str, int | None]):
-    """Sample NVIDIA device memory without touching prompts or media."""
+    """Track per-job sampled peaks in MiB, including cgroup v2 total RAM."""
     while not stop.is_set():
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -371,6 +370,9 @@ async def _run_job(job_id: str):
             "generation_started", generation=generation_number, warm=generation_number > 1,
             generation_state="initial" if generation_number == 1 else "subsequent",
             mode=job["mode"], steps=job["steps"], resolution=job["resolution"],
+            duration_seconds=job["duration_seconds"], fps=VIDEO_FPS,
+            frame_count=job["duration_seconds"] * VIDEO_FPS, audio=AUDIO,
+            vram_profile=VRAM_PROFILE, vae_output=VAE_OUTPUT,
             effective_width=job["effective_width"], effective_height=job["effective_height"],
             lora_name=job.get("lora_name"), lora_strength=job["lora_strength"], lora_stack=job["lora_stack"],
             first_block_cache_mode=FIRST_BLOCK_CACHE_MODE,
@@ -398,6 +400,7 @@ async def _run_job(job_id: str):
                 job["image_width"], job["image_height"], job["id"],
                 steps=job["steps"], audio=AUDIO, resolution=job["resolution"],
                 lora_name=job.get("lora_name"), lora_strength=job["lora_strength"], lora_stack=job["lora_stack"],
+                vae_output=VAE_OUTPUT,
             )
             for index in range(len(job["lora_stack"])):
                 node_labels[str(16 + index)] = f"lora_loader_{index + 1}"
@@ -441,7 +444,7 @@ async def _run_job(job_id: str):
 
             history = await comfy.wait(prompt_id, client_id, report, job["cancel_event"].is_set, JOB_TIMEOUT_SECONDS)
             _metric(
-                "phase", name="comfy_generation", seconds=round(time.perf_counter() - phase_started, 3),
+                "phase", name="comfy_generation", generation=generation_number, seconds=round(time.perf_counter() - phase_started, 3),
                 nodes={node_labels[node]: round(seconds, 3) for node, seconds in node_seconds.items() if node in node_labels},
                 diffusion_step_seconds=step_seconds,
             )
@@ -457,6 +460,8 @@ async def _run_job(job_id: str):
                 return
             job["stage"] = "collecting_result"
             phase_started = time.perf_counter()
+            if DEBUG_METRICS and isinstance(runtime_metrics := history.get(HISTORY_KEY), dict):
+                _metric("h3_inference", generation=generation_number, **runtime_metrics)
             outputs = history.get("outputs", {})
             _report_export_metrics(outputs.get("15", {}), generation_number)
             job["remote_outputs"] = [item for node in outputs.values() for item in (node.get("images", []) + node.get("gifs", []) + node.get("videos", []) + node.get("files", [])) if item.get("filename")]
@@ -674,6 +679,8 @@ async def health(authorization: str | None = Header(None)):
         raise HTTPException(503, "Worker is not ready") from None
     if FIRST_BLOCK_CACHE_MODE != "off" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
         raise HTTPException(503, "ComfyUI FirstBlockCache node is missing; install the pinned custom node or set IMAGINE_VIDEO_FIRST_BLOCK_CACHE=off")
+    if VAE_OUTPUT == "gpu-buffer" and BUFFERED_VAE_NODE not in available_nodes:
+        raise HTTPException(503, "ComfyUI H3 buffered VAE decode node is missing")
     lora_names = _available_lora_names() if "LoraLoaderModelOnly" in available_nodes else []
     turbo_available = TURBO_LORA in lora_names
     any_lora_available = bool(lora_names)

@@ -2,6 +2,8 @@
 
 Servicio privado de una sola cola para convertir **una imagen inicial y un prompt** en un MP4 de 3 a 30 segundos. Base y Turbo reutilizan un único stack oficial H3 cuantizado: difusión FL2VA INT8 ConvRot, encoder Qwen3VL NVFP4-AWQ y VAE de video INT8. Base no usa LoRA; Turbo aplica la LoRA Lightning oficial de 8 pasos si está instalada. Turbo es un experimento; la calidad no está garantizada y la guía oficial advierte que puede suavizar el movimiento y el audio. La cuantización y Turbo tampoco cuentan con una evaluación de calidad en este worker. Este worker se ejecuta desde el repositorio privado o desde la imagen documentada en [README-Docker.md](README-Docker.md).
 
+Consulta la [guía de inferencia H3 release-v3](README-H3-release-v3.md) para la investigación, las variables nuevas y el benchmark en RunPod.
+
 ## Estado y alcance
 
 La configuración estable 1 para H3 es **v5 Sage + Safe**: SageAttention activado en SM120, FirstBlockCache con preset Safe, resolución predeterminada 672 y 16 pasos. Los defaults de ejecución se pueden sobrescribir mediante las variables de entorno y opciones de la API documentadas abajo.
@@ -100,7 +102,7 @@ El apagado pide terminación normal al worker y a ComfyUI. Al volver a iniciar, 
 
 ### Variables de entorno
 
-El contenedor `release-v2` fija algunos valores en el Dockerfile. Los valores
+El contenedor `release-v3` fija algunos valores en el Dockerfile. Los valores
 entre paréntesis son los defaults del código cuando se ejecuta fuera de esa
 imagen. `IMAGINE_VIDEO_TOKEN` siempre es obligatorio al iniciar el worker.
 

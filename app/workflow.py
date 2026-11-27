@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 
+from h3_runtime import vae_output_mode
+
 _manifest = json.loads((Path(__file__).resolve().parents[1] / "config/model-manifest.json").read_text())
 _models = {item["id"]: item["name"] for item in _manifest["models"]}
 _optional_models = {item["id"]: item["name"] for item in _manifest.get("optional_models", [])}
@@ -15,6 +17,7 @@ AUDIO_VAE = _models["audio_vae"]
 TURBO_LORA = _optional_models["fl2v_turbo_lora_8step"]
 VIDEO_FPS = 24
 VIDEO_EXPORT_NODE = "ImagineH3ExportMP4"
+BUFFERED_VAE_NODE = "ImagineH3BufferedVAEDecode"
 SUPPORTED_DURATIONS = tuple(range(3, 31))
 DEFAULT_STEPS = 16
 ALLOWED_STEPS = tuple(range(1, 51))
@@ -108,6 +111,7 @@ def build_workflow(
     lora_strength: float = 1.0,
     lora_stack: list[dict] | None = None,
     first_block_cache: str | None = None,
+    vae_output: str | None = None,
 ) -> dict:
     """Build the ComfyUI API prompt graph for one image plus one prompt."""
     if not prompt.strip():
@@ -117,6 +121,7 @@ def build_workflow(
     width, height = canvas_for_image(image_width, image_height, resolution)
     length = model_frame_count(duration_seconds)
     steps = sampling_steps(steps)
+    decode_node = BUFFERED_VAE_NODE if vae_output_mode(vae_output) == "gpu-buffer" else "VAEDecode"
     graph = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL, "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": CLIP, "type": "minimax", "device": "default"}},
@@ -136,7 +141,7 @@ def build_workflow(
             "noise": ["9", 0], "guider": ["10", 0], "sampler": ["8", 0],
             "sigmas": ["7", 0], "latent_image": ["6", 1],
         }},
-        "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
+        "12": {"class_type": decode_node, "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
         "13": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["11", 0], "vae": ["4", 0]}},
         "15": {"class_type": VIDEO_EXPORT_NODE, "inputs": {
             "images": ["12", 0], "audio": ["13", 0],

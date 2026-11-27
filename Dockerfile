@@ -26,8 +26,8 @@ COPY config/model-manifest.json ./config/model-manifest.json
 COPY config/comfy-paths.yaml ./config/comfy-paths.yaml
 COPY app/ ./app/
 COPY custom_nodes/ ./custom_nodes/
-COPY video_export.py ./video_export.py
-COPY scripts/start.sh scripts/check_models.py scripts/stop.sh scripts/preflight_export.py scripts/benchmark_video_export.py ./scripts/
+COPY video_export.py h3_runtime.py h3_diagnostics.py ./
+COPY scripts/start.sh scripts/check_models.py scripts/stop.sh scripts/preflight_export.py scripts/benchmark_video_export.py scripts/benchmark_h3.py ./scripts/
 COPY docker/ ./docker/
 
 RUN set -eux; \
@@ -46,7 +46,7 @@ RUN set -eux; \
     .venv-comfy/bin/python -m pip install --no-deps "/tmp/$wheel_name"; \
     rm "/tmp/$wheel_name"; \
     bash -n docker/entrypoint.sh && bash -n scripts/start.sh && \
-    .venv-comfy/bin/python -m compileall -q app custom_nodes docker scripts video_export.py
+    .venv-comfy/bin/python -m compileall -q app custom_nodes docker scripts video_export.py h3_runtime.py h3_diagnostics.py
 
 ARG BUILDARCH
 ARG TARGETARCH
