@@ -1,7 +1,7 @@
-# Imagine Video Worker — Docker release v1
+# Imagine Video Worker — Docker release v2
 
 Imagen de release para desplegar el worker privado en una Pod Linux con NVIDIA.
-La etiqueta corregida es `christiancollaguazo/imagine-video-worker:release-v1`.
+La etiqueta de esta versión es `christiancollaguazo/imagine-video-worker:release-v2`.
 El `Dockerfile` parte de la imagen validada `turbo-v1`, conserva los pesos H3
 fijados por manifiesto fuera de la imagen y añade el worker, FirstBlockCache y
 SageAttention. La imagen requiere GPU SM120 (Blackwell) con la rueda SageAttention
@@ -15,7 +15,7 @@ Desde la raíz del repositorio, con Docker Desktop iniciado y sesión en Docker 
 docker login
 docker buildx build --platform linux/amd64 \
   --build-arg IMAGINE_SOURCE_COMMIT="$(git rev-parse HEAD)" \
-  -t christiancollaguazo/imagine-video-worker:release-v1 --push .
+  -t christiancollaguazo/imagine-video-worker:release-v2 --push .
 ```
 
 Para construir y cargar localmente en vez de publicar, sustituye `--push` por
@@ -24,15 +24,19 @@ Para construir y cargar localmente en vez de publicar, sustituye `--push` por
 conjuntamente. El Dockerfile verifica el hash antes de instalarla. La rueda
 predeterminada es community-built para Linux x86_64, Python 3.12,
 PyTorch 2.11.0+cu130 y SM120; no es una distribución oficial de SageAttention.
-No se ha ejecutado aquí un build ni inferencia CUDA.
+Las compilaciones nativas ejecutan pruebas de exportación con CPU. Las
+compilaciones cruzadas validan la versión de ComfyUI y la disponibilidad de
+los codificadores de PyAV. La prueba NVENC se ejecuta con una GPU NVIDIA.
 
 ## Desplegar en RunPod
 
-- Imagen: `christiancollaguazo/imagine-video-worker:release-v1`.
+- Imagen: `christiancollaguazo/imagine-video-worker:release-v2`.
 - GPU NVIDIA Blackwell SM120 y disco local de contenedor de al menos 100 GB.
 - Puerto HTTP `8000` únicamente. ComfyUI en `8188` no debe exponerse.
 - Deja vacío el comando de inicio para usar el entrypoint de la imagen.
 - Inyecta `IMAGINE_VIDEO_TOKEN` desde RunPod Secrets.
+- Para videos sin pista de audio, configura `IMAGINE_H3_AUDIO=0`. Configura
+  `IMAGINE_REQUIRE_NVENC=1` para comprobar NVENC antes de preparar los pesos.
 - Para conservar modelos entre Pods, adjunta un Global Volume en
   `/workspace-global`. Para una descarga local al disco del contenedor, usa el
   modo `download` documentado en la tabla de variables.
@@ -43,6 +47,23 @@ Solo una Pod debe poblarlo a la vez. En los arranques posteriores, el worker
 copia los pesos del volumen al disco local y los verifica. Sin el indicador de
 descarga, los archivos faltantes causan un error y no se recurre a Hugging Face.
 Configura `HF_TOKEN` como secreto si el repositorio de modelos exige acceso.
+
+### Verificación de NVENC antes de iniciar el worker
+
+Con `IMAGINE_REQUIRE_NVENC=1`, el entrypoint registra el nodo de exportación de
+ComfyUI, comprueba que codificó con `h264_nvenc` y valida un MP4 de 24 cuadros
+a 672×896 sin audio. Si falla, el contenedor sale antes de preparar los pesos.
+El evento `video_export_preflight` indica que la comprobación terminó.
+
+Para ejecutar únicamente la comprobación en un host Docker con GPU, sin
+arrancar el worker ni preparar los pesos:
+
+```bash
+docker run --rm --gpus all \
+  --entrypoint /opt/imagine-video-worker/.venv-comfy/bin/python \
+  christiancollaguazo/imagine-video-worker:release-v2 \
+  /opt/imagine-video-worker/scripts/preflight_export.py
+```
 
 ## Variables de entorno
 
@@ -60,7 +81,8 @@ Los valores booleanos se activan solo con el texto exacto `1`.
 | `IMAGINE_VIDEO_STEPS` | `16` | Pasos por defecto; entero entre 1 y 50. Una petición puede sobrescribirlo. |
 | `IMAGINE_VIDEO_FIRST_BLOCK_CACHE` | `safe` | `safe`, `fast` u `off`. `safe` usa `H3 Safe — 0.08 / max 2`; `fast` usa `H3 Fast — 0.10 / max 2`. |
 | `IMAGINE_SAGE_ATTENTION` | `on` (Dockerfile) | `on` exige SM120 y una prueba Sage correcta; `auto` permite fallback a PyTorch SDPA; `off` selecciona PyTorch SDPA. |
-| `IMAGINE_H3_AUDIO` | `1` (Dockerfile) | `1` genera audio; cualquier otro valor lo desactiva. |
+| `IMAGINE_H3_AUDIO` | `1` (Dockerfile) | `1` genera una pista de audio y `0` omite su decodificación y exportación. |
+| `IMAGINE_REQUIRE_NVENC` | `0` | Con `1`, exige una prueba de codificación NVENC antes de preparar los pesos. |
 | `IMAGINE_H3_VRAM_PROFILE` | `auto` (Dockerfile) | Perfil de VRAM pasado al workflow H3. |
 | `IMAGINE_DEBUG_METRICS` | `0` (Dockerfile) | Con `1`, emite métricas técnicas de arranque y generación a stdout. |
 | `IMAGINE_VIDEO_JOB_TIMEOUT_SECONDS` | `5400` | Timeout de generación en segundos; valores menores se ajustan a 60. |
@@ -104,6 +126,47 @@ IMAGINE_SAGE_ATTENTION=auto
 En este modo los aproximadamente 42 GB se vuelven a descargar para cada
 contenedor nuevo. En hardware distinto de SM120, establece
 `IMAGINE_SAGE_ATTENTION=auto` para permitir fallback, o `off` para usar SDPA.
+
+## Benchmark aislado de exportación
+
+En una Pod existente con el runtime instalado, ejecuta estos comandos desde el
+checkout actualizado del worker. En una imagen `release-v2`, usa
+`cd /opt/imagine-video-worker`. El script solo carga PyTorch, PyAV y los
+fotogramas de prueba. El script puede ejecutarse con los servicios detenidos y
+no descarga pesos ni requiere el token de la API.
+
+```bash
+runtime=/opt/imagine-video-worker/.venv-comfy/bin/python
+"$runtime" scripts/benchmark_video_export.py --width 672 --height 896 --seconds 3 --encoder both --repeat 3
+"$runtime" scripts/benchmark_video_export.py --width 672 --height 1184 --seconds 15 --encoder both --repeat 3
+"$runtime" scripts/benchmark_video_export.py --width 672 --height 1184 --seconds 15 --device cuda --encoder h264_nvenc --repeat 3
+"$runtime" scripts/benchmark_video_export.py --width 672 --height 1184 --seconds 15 --encoder h264_nvenc --strategies legacy pyav --torch-threads 1 --repeat 3
+```
+
+- `legacy` reproduce el primer pase por fotograma y el segundo pase de FFmpeg
+  con x264. `pyav` usa el exportador del worker. `ffmpeg` envía RGB por pipe
+  a un único proceso FFmpeg. Las tres variantes reciben el mismo tensor.
+- `--encoder h264_nvenc` exige una codificación de prueba en PyAV. `--encoder
+  both` compara NVENC con x264 cuando NVENC está disponible. Para NVENC, el
+  contenedor necesita acceso a la capacidad `video` del driver NVIDIA.
+- La salida JSONL incluye tiempos, FPS, afinidad, cuotas de CPU, hilos de
+  PyTorch, picos de RSS y memoria de GPU, y tamaño del MP4. PSNR y SSIM se
+  calculan contra una referencia sin pérdida fuera del tiempo de exportación.
+  La memoria de GPU de `nvidia-smi` se mide por dispositivo y puede incluir
+  otros procesos. La memoria PyTorch CUDA se mide por proceso.
+- Para evaluar contenido real, añade `--input-video /tmp/referencia.mp4` con
+  al menos `source_frames` fotogramas decodificables. Añade
+  `--keep-output /tmp/imagine-export-review` para comparar visualmente los MP4.
+  Por defecto se usan fotogramas sintéticos y se eliminan los archivos
+  temporales. El benchmark compara video sin audio.
+
+Con `IMAGINE_DEBUG_METRICS=1`, `imagine_metric` con `event=video_export`
+incluye el codificador efectivo, el fallback, la duración, los FPS, las
+dimensiones y strides del tensor, la preparación, la transferencia al CPU,
+la conversión de formato, la codificación, el mux y el cierre del MP4.
+El evento `video_encoder_fallback` se emite también con métricas desactivadas.
+`mp4_finalize` mide la validación final con `ffprobe`. El worker solo publica
+el resultado tras validar el formato, el número exacto de cuadros y la duración.
 
 ## Conectar Imagine
 

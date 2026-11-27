@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import hmac
 import json
@@ -11,6 +12,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -57,16 +59,103 @@ COMFY_NODE_LABELS = {
     "1": "diffusion_model_loader", "2": "text_encoder_loader",
     "3": "video_vae_loader", "4": "audio_vae_loader", "5": "image_load",
     "6": "prompt_and_image_encode", "11": "diffusion", "12": "video_vae_decode",
-    "13": "audio_decode", "14": "video_mux", "15": "mp4_export",
+    "13": "audio_decode", "15": "mp4_export",
 }
 VRAM_PROFILE = os.environ.get("IMAGINE_H3_VRAM_PROFILE", "auto")
 _generation_count = 0
 
 
-def _metric(event: str, **values):
+def _metric(event: str, *, always: bool = False, **values):
     """Emit technical-only diagnostics; never include request or credential data."""
-    if DEBUG_METRICS:
+    if DEBUG_METRICS or always:
         print("imagine_metric " + json.dumps({"event": event, **values}, sort_keys=True), flush=True)
+
+
+def _report_export_metrics(node_output: dict, generation: int):
+    records = node_output.get("video_export_metrics", [])
+    if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+        return
+    record = records[0]
+    if record.get("encoder") == "libx264" and record.get("hardware_fallback") is True:
+        _metric("video_encoder_fallback", always=True, generation=generation, encoder="libx264")
+    if not DEBUG_METRICS:
+        return
+    values = {}
+
+    def numbers(source, keys):
+        return {key: value for key in keys if type(value := source.get(key)) in (int, float) and 0 <= value < 1e12}
+
+    values.update(numbers(record, ("seconds", "fps", "frame_count", "duration_seconds", "throughput_fps")))
+    for key in ("tensor_shape", "tensor_strides"):
+        dimensions = record.get(key)
+        if isinstance(dimensions, list) and len(dimensions) == 4 and all(type(n) is int and 0 <= n < 2**48 for n in dimensions):
+            values[key] = dimensions
+    for key, allowed in (
+        ("encoder", ("h264_nvenc", "libx264")),
+        ("tensor_dtype", ("torch.float32", "torch.float64", "torch.float16", "torch.bfloat16")),
+    ):
+        if record.get(key) in allowed:
+            values[key] = record[key]
+    device = record.get("tensor_device")
+    if isinstance(device, str):
+        kind, _, index = device.partition(":")
+        if kind in {"cpu", "cuda", "mps", "xpu"}:
+            values["tensor_device"] = kind
+            if index.isascii() and index.isdecimal() and len(index) <= 3:
+                values["tensor_device_index"] = int(index)
+    if type(record.get("hardware_fallback")) is bool:
+        values["hardware_fallback"] = record["hardware_fallback"]
+    stages = record.get("stages_seconds")
+    if isinstance(stages, dict):
+        values["stages_seconds"] = numbers(stages, (
+            "frame_preparation", "device_to_cpu", "frame_wrapping", "pixel_conversion", "encoding", "muxing", "finalization",
+        ))
+    _metric("video_export", generation=generation, **values)
+
+
+async def _collect_video(job, info, result_path):
+    output_root = COMFY_OUTPUT_DIR.resolve()
+    job_directory = output_root / "imagine_h3" / job["id"]
+    source = (output_root / info.get("subfolder", "") / info["filename"]).resolve()
+    if info.get("type") == "output" and source.parent == job_directory and source.is_file():
+        try:
+            source.replace(result_path)
+            return "local_move"
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+    await comfy.download(info, result_path, job["cancel_event"].is_set)
+    return "http_stream"
+
+
+async def _validate_video(path, frame_count, duration, expect_audio, width, height):
+    probe = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_entries",
+        "stream=codec_type,codec_name,pix_fmt,width,height,nb_frames,avg_frame_rate,start_pts,duration_ts,time_base",
+        "-of", "json", str(path), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        output, _ = await asyncio.wait_for(probe.communicate(), timeout=10)
+    finally:
+        if probe.returncode is None:
+            probe.kill()
+            await probe.wait()
+    streams = json.loads(output)["streams"] if probe.returncode == 0 else []
+    videos = [stream for stream in streams if stream["codec_type"] == "video"]
+    audio = [stream for stream in streams if stream["codec_type"] == "audio"]
+    if len(videos) != 1 or len(audio) != int(expect_audio):
+        raise RuntimeError("Video did not match the requested stream layout")
+    video = videos[0]
+    if (video.get("width"), video.get("height")) != (width, height):
+        raise RuntimeError("Video did not match the requested resolution")
+    if (video.get("codec_name") != "h264" or video.get("pix_fmt") != "yuv420p"
+            or video.get("nb_frames") != str(frame_count) or video.get("start_pts") != 0
+            or Fraction(video["avg_frame_rate"]) != VIDEO_FPS
+            or video["duration_ts"] * Fraction(video["time_base"]) != duration):
+        raise RuntimeError("Video did not match the requested duration, native frame count and FPS")
+    if audio and (audio[0]["codec_name"] != "aac" or audio[0].get("start_pts") != 0
+                  or not 0 < audio[0]["duration_ts"] * Fraction(audio[0]["time_base"]) <= duration):
+        raise RuntimeError("Audio did not match the requested video timeline")
 
 
 async def _sample_gpu_peak(stop: asyncio.Event, peaks: dict[str, int | None]):
@@ -369,66 +458,24 @@ async def _run_job(job_id: str):
             job["stage"] = "collecting_result"
             phase_started = time.perf_counter()
             outputs = history.get("outputs", {})
+            _report_export_metrics(outputs.get("15", {}), generation_number)
             job["remote_outputs"] = [item for node in outputs.values() for item in (node.get("images", []) + node.get("gifs", []) + node.get("videos", []) + node.get("files", [])) if item.get("filename")]
             (job["folder"] / "remote.json").write_text(json.dumps({"comfy_name": comfy_name, "remote_outputs": job["remote_outputs"], "prompt_id": prompt_id}))
             info = next((item for item in job["remote_outputs"] if item.get("filename", "").lower().endswith(".mp4")), None)
             if not info:
                 raise RuntimeError("ComfyUI finished without a video output")
-            payload = await comfy.download(info)
-            _metric("phase", name="result_download", seconds=round(time.perf_counter() - phase_started, 3))
+            result_path = job["folder"] / "result.mp4"
+            collection = await _collect_video(job, info, result_path)
+            _metric("phase", name="result_download", seconds=round(time.perf_counter() - phase_started, 3), method=collection)
             if job["cancel_event"].is_set():
                 return
-            if not payload:
-                raise RuntimeError("ComfyUI returned an empty video")
-            raw_path = job["folder"] / "comfy-output.mp4"
-            result_path = job["folder"] / "result.mp4"
-            raw_path.write_bytes(payload)
-            frame_count = job["duration_seconds"] * VIDEO_FPS
-            command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-protocol_whitelist", "file,pipe", "-i", str(raw_path), "-map", "0:v:0", "-map", "0:a?", "-map_metadata", "-1", "-frames:v", str(frame_count), "-t", str(job["duration_seconds"]), "-fps_mode", "passthrough", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-af", f"atrim=duration={job['duration_seconds']}", "-movflags", "+faststart", str(result_path)]
-            process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
             phase_started = time.perf_counter()
-            communicate = asyncio.create_task(process.communicate())
-            cancelled = asyncio.create_task(job["cancel_event"].wait())
-            try:
-                done, _ = await asyncio.wait({communicate, cancelled}, return_when=asyncio.FIRST_COMPLETED)
-                if cancelled in done:
-                    return
-                communicate.result()
-            finally:
-                cancelled.cancel()
-                await asyncio.gather(cancelled, return_exceptions=True)
-                if process.returncode is None:
-                    try:
-                        process.terminate()
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        await asyncio.wait_for(asyncio.shield(communicate), timeout=5)
-                    except asyncio.TimeoutError:
-                        if process.returncode is None:
-                            process.kill()
-                        await communicate
-            if process.returncode:
-                raise RuntimeError("Video finalization failed")
-            probe = await asyncio.create_subprocess_exec(
-                "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-                "stream=nb_frames,avg_frame_rate", "-of", "json", str(result_path),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            )
-            try:
-                output, _ = await asyncio.wait_for(probe.communicate(), timeout=10)
-            finally:
-                if probe.returncode is None:
-                    probe.kill()
-                    await probe.wait()
-            streams = json.loads(output)["streams"] if probe.returncode == 0 else []
-            if (len(streams) != 1 or streams[0].get("nb_frames") != str(frame_count)
-                    or streams[0].get("avg_frame_rate") != f"{VIDEO_FPS}/1"):
-                raise RuntimeError("Video did not match the requested native frame count and FPS")
+            duration = job["duration_seconds"]
+            await _validate_video(result_path, duration * VIDEO_FPS, duration, AUDIO,
+                                  job["effective_width"], job["effective_height"])
             _metric("phase", name="mp4_finalize", seconds=round(time.perf_counter() - phase_started, 3))
             if job["cancel_event"].is_set():
                 return
-            raw_path.unlink(missing_ok=True)
             job["result_path"] = result_path
             # Keep the cleanup marker until Comfy's copies and history are gone.
             _purge_comfy_files(job)
@@ -616,12 +663,13 @@ async def health(authorization: str | None = Header(None)):
         "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
         "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
         "vae/minimax_h3_video_vae_int8_convrot.safetensors",
-        "vae/minimax_h3_audio_vae_fp32.safetensors",
     )
+    if AUDIO:
+        models += ("vae/minimax_h3_audio_vae_fp32.safetensors",)
     if any(not (COMFY_ROOT / "models" / relative).is_file() for relative in models):
         raise HTTPException(503, "Worker is not ready")
     try:
-        available_nodes = await comfy.health()
+        available_nodes = await comfy.health(audio=AUDIO)
     except Exception:
         raise HTTPException(503, "Worker is not ready") from None
     if FIRST_BLOCK_CACHE_MODE != "off" and FIRST_BLOCK_CACHE_NODE not in available_nodes:
@@ -658,7 +706,7 @@ async def health(authorization: str | None = Header(None)):
 async def list_loras(authorization: str | None = Header(None)):
     _authorized(authorization)
     try:
-        available_nodes = await comfy.health()
+        available_nodes = await comfy.health(audio=AUDIO)
     except Exception:
         raise HTTPException(503, "ComfyUI is not ready") from None
     names = _available_lora_names() if "LoraLoaderModelOnly" in available_nodes else []
@@ -720,7 +768,7 @@ async def create_job(
         raise HTTPException(422, "lora_stack must be a JSON array") from None
     if FIRST_BLOCK_CACHE_MODE != "off" or selected_stack:
         try:
-            available_nodes = await comfy.health()
+            available_nodes = await comfy.health(audio=AUDIO)
         except Exception:
             raise HTTPException(503, "ComfyUI is not ready") from None
         if FIRST_BLOCK_CACHE_MODE != "off" and FIRST_BLOCK_CACHE_NODE not in available_nodes:

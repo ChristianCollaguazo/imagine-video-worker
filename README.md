@@ -100,7 +100,7 @@ El apagado pide terminación normal al worker y a ComfyUI. Al volver a iniciar, 
 
 ### Variables de entorno
 
-El contenedor `release-v1` fija algunos valores en el Dockerfile; los valores
+El contenedor `release-v2` fija algunos valores en el Dockerfile. Los valores
 entre paréntesis son los defaults del código cuando se ejecuta fuera de esa
 imagen. `IMAGINE_VIDEO_TOKEN` siempre es obligatorio al iniciar el worker.
 

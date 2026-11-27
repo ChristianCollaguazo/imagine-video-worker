@@ -14,6 +14,7 @@ VIDEO_VAE = _models["video_vae"]
 AUDIO_VAE = _models["audio_vae"]
 TURBO_LORA = _optional_models["fl2v_turbo_lora_8step"]
 VIDEO_FPS = 24
+VIDEO_EXPORT_NODE = "ImagineH3ExportMP4"
 SUPPORTED_DURATIONS = tuple(range(3, 31))
 DEFAULT_STEPS = 16
 ALLOWED_STEPS = tuple(range(1, 51))
@@ -137,11 +138,10 @@ def build_workflow(
         }},
         "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
         "13": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["11", 0], "vae": ["4", 0]}},
-        "14": {"class_type": "CreateVideo", "inputs": {"images": ["12", 0], "audio": ["13", 0], "fps": VIDEO_FPS}},
-        "15": {"class_type": "SaveVideo", "inputs": {
-            "video": ["14", 0], "filename_prefix": f"imagine_h3/{job_id or 'job'}/video",
-            "format": "mp4", "format.codec": "h264",
-            "format.codec.encoding": "re-encode", "format.codec.encoding.crf": 18,
+        "15": {"class_type": VIDEO_EXPORT_NODE, "inputs": {
+            "images": ["12", 0], "audio": ["13", 0],
+            "filename_prefix": f"imagine_h3/{job_id or 'job'}/video",
+            "fps": VIDEO_FPS, "frame_count": duration_seconds * VIDEO_FPS,
         }},
     }
     stack = lora_stack if lora_stack is not None else ([{"name": lora_name, "strength": lora_strength}] if lora_name else [])
@@ -177,7 +177,7 @@ def build_workflow(
         # FL2VA still generates joint latents. Only skip decoding and muxing the audio.
         del graph["4"]
         del graph["13"]
-        del graph["14"]["inputs"]["audio"]
+        del graph["15"]["inputs"]["audio"]
     return graph
 
 

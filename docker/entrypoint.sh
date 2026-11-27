@@ -16,6 +16,9 @@ boot_started=$SECONDS
 export IMAGINE_VIDEO_RUN_ROOT=/tmp/imagine-video-worker
 # Fail fast on incompatible GPU before copying large weights.
 .venv-comfy/bin/python -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable"; assert torch.cuda.is_bf16_supported(), "BF16 unavailable"; print(torch.cuda.get_device_name(0), flush=True)'
+if [[ "${IMAGINE_REQUIRE_NVENC:-0}" == "1" ]]; then
+  .venv-comfy/bin/python scripts/preflight_export.py
+fi
 if .venv-comfy/bin/python docker/stage_models.py; then
   :
 else

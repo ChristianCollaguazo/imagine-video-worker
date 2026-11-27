@@ -28,7 +28,6 @@ case "${IMAGINE_SAGE_ATTENTION:-on}" in
 esac
 
 : "${IMAGINE_VIDEO_TOKEN:?Set IMAGINE_VIDEO_TOKEN in the process environment}"
-command -v ffmpeg >/dev/null || { echo "ffmpeg is required" >&2; exit 1; }
 command -v ffprobe >/dev/null || { echo "ffprobe is required" >&2; exit 1; }
 "$ROOT/.venv-comfy/bin/python" -c 'import torch, torchaudio; assert torch.cuda.is_available(), "CUDA is unavailable to PyTorch"; assert torch.cuda.is_bf16_supported(), "GPU does not report BF16 support"'
 attention_status="$(PYTHONPATH="$ROOT" "$ROOT/.venv-comfy/bin/python" -m app.attention_backend)"
@@ -104,8 +103,9 @@ log_comfy() {
   done
 }
 run_comfy() {
-  exec "$ROOT/.venv-comfy/bin/python" "$COMFY_ROOT/main.py" \
+  PYTHONPATH="$ROOT" exec "$ROOT/.venv-comfy/bin/python" "$COMFY_ROOT/main.py" \
     --base-directory "$COMFY_ROOT" "${comfy_args[@]}" \
+    --extra-model-paths-config "$ROOT/config/comfy-paths.yaml" \
     --input-directory "$COMFY_INPUT_DIR" \
     --output-directory "$COMFY_OUTPUT_DIR" \
     --temp-directory "$RUN_ROOT/comfy" \

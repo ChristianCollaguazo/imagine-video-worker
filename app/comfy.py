@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import json
+from pathlib import Path
 import uuid
 from urllib.parse import urlencode
 
 import httpx
 import websockets
+
+from .workflow import VIDEO_EXPORT_NODE
 
 MODEL_LOADER_TYPES = {
     "UNETLoader": "diffusion_model_loader",
@@ -79,7 +83,7 @@ class ComfyClient:
     async def close(self):
         await self.http.aclose()
 
-    async def health(self):
+    async def health(self, *, audio: bool = True):
         response = await self.http.get("/system_stats")
         response.raise_for_status()
         if not any(device.get("type") == "cuda" for device in response.json().get("devices", [])):
@@ -87,7 +91,9 @@ class ComfyClient:
         schemas = await self.http.get("/object_info")
         schemas.raise_for_status()
         available = schemas.json()
-        required = {"UNETLoader", "CLIPLoader", "VAELoader", "LoadImage", "MiniMaxH3ImageToVideo", "BasicScheduler", "KSamplerSelect", "RandomNoise", "BasicGuider", "SamplerCustomAdvanced", "VAEDecode", "VAEDecodeAudio", "CreateVideo", "SaveVideo"}
+        required = {"UNETLoader", "CLIPLoader", "VAELoader", "LoadImage", "MiniMaxH3ImageToVideo", "BasicScheduler", "KSamplerSelect", "RandomNoise", "BasicGuider", "SamplerCustomAdvanced", "VAEDecode", VIDEO_EXPORT_NODE}
+        if audio:
+            required.add("VAEDecodeAudio")
         missing = required.difference(available)
         if missing:
             raise RuntimeError("Required ComfyUI nodes are unavailable")
@@ -123,6 +129,7 @@ class ComfyClient:
                     except asyncio.TimeoutError:
                         history = await self.history(prompt_id)
                         if prompt_id in history:
+                            report({"node_started": None})
                             _raise_history_loader_failure(history, prompt_id)
                             return history[prompt_id]
                         continue
@@ -137,7 +144,7 @@ class ComfyClient:
                     elif message.get("type") == "executing" and data.get("node") is not None:
                         node = str(data.get("node"))
                         report({"node_started": node})
-                        stage = "decoding_video" if node in {"12", "13"} else "exporting_video" if node in {"14", "15"} else None
+                        stage = "decoding_video" if node in {"12", "13"} else "exporting_video" if node == "15" else None
                         if stage:
                             report({"node": node, "stage": stage})
                     elif message.get("type") == "execution_error":
@@ -164,15 +171,21 @@ class ComfyClient:
                     return None
                 history = await self.history(prompt_id)
                 if prompt_id in history:
+                    report({"node_started": None})
                     _raise_history_loader_failure(history, prompt_id)
                     return history[prompt_id]
                 await asyncio.sleep(2)
         raise TimeoutError("ComfyUI did not complete the job in time")
 
-    async def download(self, file_info: dict) -> bytes:
-        response = await self.http.get("/view", params={"filename": file_info["filename"], "subfolder": file_info.get("subfolder", ""), "type": file_info.get("type", "output")})
-        response.raise_for_status()
-        return response.content
+    async def download(self, file_info: dict, path: Path, cancelled: Callable[[], bool]) -> None:
+        params = {"filename": file_info["filename"], "subfolder": file_info.get("subfolder", ""), "type": file_info.get("type", "output")}
+        async with self.http.stream("GET", "/view", params=params) as response:
+            response.raise_for_status()
+            with path.open("xb") as output:
+                async for chunk in response.aiter_bytes(chunk_size=256 * 1024):
+                    if cancelled():
+                        return
+                    output.write(chunk)
 
     async def cancel(self, prompt_id: str, timeout: int = 120) -> bool:
         try:
